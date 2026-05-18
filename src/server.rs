@@ -139,14 +139,14 @@ async fn connection_loop(
             tokio::select! {
                 _ = heartbeat.tick() => {
                     if ws_sender.send(Message::Ping(Vec::new())).await.is_err() {
-                        break;
+                        return Err(anyhow::anyhow!("failed to send websocket ping"));
                     }
                 }
                 message = client_rx.recv() => {
                     match message {
                         Some(message) => {
                             if ws_sender.send(message).await.is_err() {
-                                break;
+                                return Err(anyhow::anyhow!("failed to send websocket message"));
                             }
                             writer_state.metrics.message_out();
                         }
@@ -155,6 +155,7 @@ async fn connection_loop(
                 }
             }
         }
+        Ok::<_, anyhow::Error>(())
     });
 
     let fanout_state = state.clone();
@@ -162,7 +163,11 @@ async fn connection_loop(
     let fanout = tokio::spawn(async move {
         loop {
             match topic_rx.recv().await {
-                Ok(raw) => send_json(&fanout_tx, &raw, &fanout_state),
+                Ok(raw) => {
+                    if !send_json(&fanout_tx, &raw, &fanout_state) {
+                        return Err(anyhow::anyhow!("client send queue is full or closed"));
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     fanout_state.metrics.message_dropped();
                     warn!(skipped, "client lagged behind topic broadcast");
@@ -170,29 +175,34 @@ async fn connection_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
+        Ok::<_, anyhow::Error>(())
     });
 
     let idle_timeout = state.config.idle_timeout;
-    let reader = async {
+    let reader_state = state.clone();
+    let reader_tx = client_tx.clone();
+    let reader_topic = topic.clone();
+    let reader_client_id = client_id.clone();
+    let reader = tokio::spawn(async move {
         loop {
             tokio::select! {
                 frame = ws_receiver.next() => {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
-                            state.metrics.message_in();
-                            if text.len() > state.config.max_text_bytes {
-                                state.metrics.protocol_error();
-                                send_error(&client_tx, "message_too_large", "text message exceeds configured limit", &state);
+                            reader_state.metrics.message_in();
+                            if text.len() > reader_state.config.max_text_bytes {
+                                reader_state.metrics.protocol_error();
+                                send_error(&reader_tx, "message_too_large", "text message exceeds configured limit", &reader_state);
                                 continue;
                             }
-                            handle_text(&state, &client_tx, &topic, &client_id, &text).await;
+                            handle_text(&reader_state, &reader_tx, &reader_topic, &reader_client_id, &text).await;
                         }
                         Some(Ok(Message::Binary(_))) => {
-                            state.metrics.protocol_error();
-                            send_error(&client_tx, "unsupported_message", "binary messages are not supported", &state);
+                            reader_state.metrics.protocol_error();
+                            send_error(&reader_tx, "unsupported_message", "binary messages are not supported", &reader_state);
                         }
                         Some(Ok(Message::Ping(payload))) => {
-                            let _ = client_tx.try_send(Message::Pong(payload));
+                            let _ = reader_tx.try_send(Message::Pong(payload));
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close(_))) | None => break,
@@ -200,7 +210,7 @@ async fn connection_loop(
                     }
                 }
                 _ = sleep(idle_timeout) => {
-                    let _ = client_tx.try_send(Message::Close(Some(CloseFrame {
+                    let _ = reader_tx.try_send(Message::Close(Some(CloseFrame {
                         code: axum::extract::ws::close_code::NORMAL,
                         reason: "idle timeout".into(),
                     })));
@@ -209,15 +219,26 @@ async fn connection_loop(
             }
         }
         Ok::<_, anyhow::Error>(())
+    });
+
+    tokio::pin!(reader);
+    tokio::pin!(writer);
+    tokio::pin!(fanout);
+
+    let result = tokio::select! {
+        result = &mut reader => task_result("reader", result),
+        result = &mut writer => task_result("writer", result),
+        result = &mut fanout => task_result("fanout", result),
     };
 
-    let reader_result = reader.await;
+    reader.abort();
     fanout.abort();
     writer.abort();
+    let _ = reader.await;
     let _ = fanout.await;
     let _ = writer.await;
     state.unregister_client(&client_id, connection_id).await;
-    reader_result
+    result
 }
 
 async fn handle_text(
@@ -299,7 +320,9 @@ async fn handle_text(
                 request_id: request_id.as_deref(),
                 payload: payload.as_ref(),
             }) {
-                Ok(encoded) => send_json(client_tx, &encoded, state),
+                Ok(encoded) => {
+                    let _ = send_json(client_tx, &encoded, state);
+                }
                 Err(_) => send_error(client_tx, "encode_failed", "failed to encode pong", state),
             }
         }
@@ -321,11 +344,28 @@ fn send_error(client_tx: &mpsc::Sender<Message>, code: &str, message: &str, stat
     }
 }
 
-fn send_json(client_tx: &mpsc::Sender<Message>, text: &str, state: &SharedState) {
+fn send_json(client_tx: &mpsc::Sender<Message>, text: &str, state: &SharedState) -> bool {
     match client_tx.try_send(Message::Text(text.to_owned())) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => state.metrics.message_dropped(),
-        Err(mpsc::error::TrySendError::Closed(_)) => state.metrics.message_dropped(),
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            state.metrics.message_dropped();
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            state.metrics.message_dropped();
+            false
+        }
+    }
+}
+
+fn task_result(
+    task_name: &str,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(err) if err.is_cancelled() => Ok(()),
+        Err(err) => Err(anyhow::anyhow!("{task_name} task failed: {err}")),
     }
 }
 
