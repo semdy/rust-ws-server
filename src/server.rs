@@ -239,18 +239,33 @@ async fn connection_loop(
     tokio::pin!(writer);
     tokio::pin!(fanout);
 
-    let result = tokio::select! {
-        result = &mut reader => task_result("reader", result),
-        result = &mut writer => task_result("writer", result),
-        result = &mut fanout => task_result("fanout", result),
+    let (completed_task, result) = tokio::select! {
+        result = &mut reader => (ConnectionTask::Reader, task_result("reader", result)),
+        result = &mut writer => (ConnectionTask::Writer, task_result("writer", result)),
+        result = &mut fanout => (ConnectionTask::Fanout, task_result("fanout", result)),
     };
 
-    reader.abort();
-    fanout.abort();
-    writer.abort();
-    let _ = reader.await;
-    let _ = fanout.await;
-    let _ = writer.await;
+    match completed_task {
+        ConnectionTask::Reader => {
+            fanout.abort();
+            writer.abort();
+            let _ = fanout.await;
+            let _ = writer.await;
+        }
+        ConnectionTask::Writer => {
+            reader.abort();
+            fanout.abort();
+            let _ = reader.await;
+            let _ = fanout.await;
+        }
+        ConnectionTask::Fanout => {
+            reader.abort();
+            writer.abort();
+            let _ = reader.await;
+            let _ = writer.await;
+        }
+    }
+
     state.unregister_client(&client_id, connection_id);
     result
 }
@@ -381,6 +396,13 @@ fn task_result(
         Err(err) if err.is_cancelled() => Ok(()),
         Err(err) => Err(anyhow::anyhow!("{task_name} task failed: {err}")),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConnectionTask {
+    Reader,
+    Writer,
+    Fanout,
 }
 
 #[derive(Debug)]
