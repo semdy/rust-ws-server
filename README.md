@@ -11,8 +11,10 @@
 - 每连接消息速率限制，异常客户端会被主动关闭
 - Ping/Pong 与空闲超时，主动清理僵尸连接
 - `/healthz`、`/readyz`、`/metrics` 运维端点
-- JSON 协议、结构化日志、优雅退出
-- 集成测试覆盖发布、广播、限流路径
+- MessagePack 二进制出站协议，内部使用 `bytes::Bytes` 共享消息 buffer
+- 兼容 JSON 文本入站，也支持 MessagePack 二进制入站
+- 结构化日志、优雅退出
+- 集成测试覆盖发布、广播、私聊、限流、MessagePack 入站路径
 
 ## 运行
 
@@ -43,6 +45,13 @@ cargo run --release
 ```
 
 ## 客户端消息
+
+客户端入站兼容两种格式：
+
+- 浏览器/调试友好：发送 JSON 文本 frame
+- 高性能路径：发送 MessagePack 二进制 frame
+
+服务端出站统一返回 MessagePack 二进制 frame。Web 示例页面已经内置当前协议所需的轻量 MessagePack 解码器。
 
 发布消息到当前主题：
 
@@ -76,6 +85,17 @@ cargo run --release
 
 ```json
 {"kind":"direct_message","from":"alice","to":"bob","request_id":"3","payload":{"text":"hello bob"}}
+```
+
+Rust 客户端发送 MessagePack binary frame 的形态：
+
+```rust
+let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+    "kind": "publish",
+    "request_id": "r1",
+    "payload": { "text": "hello msgpack" }
+}))?;
+ws.send(Message::Binary(bytes.into())).await?;
 ```
 
 ## Web 客户端示例

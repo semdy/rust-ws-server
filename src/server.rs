@@ -1,13 +1,10 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
     extract::{
         Query, State,
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -24,8 +21,11 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
 
 use crate::{
-    protocol::{ClientEvent, ServerEvent, encode_server_event, parse_client_event},
-    state::SharedState,
+    protocol::{
+        ClientEvent, ServerEvent, encode_server_event, parse_client_event_binary,
+        parse_client_event_text,
+    },
+    state::{OutboundMessage, SharedState},
 };
 
 #[derive(Debug, Deserialize)]
@@ -118,14 +118,15 @@ async fn connection_loop(
     client_id: String,
 ) -> anyhow::Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (client_tx, mut client_rx) = mpsc::channel::<Message>(state.config.client_queue_capacity);
+    let (client_tx, mut client_rx) =
+        mpsc::channel::<OutboundMessage>(state.config.client_queue_capacity);
     let mut topic_rx = state.subscribe(&topic);
     let connection_id = state.next_connection_id();
     state.register_client(client_id.clone(), connection_id, client_tx.clone());
 
-    send_json(
+    send_encoded(
         &client_tx,
-        &encode_server_event(&ServerEvent::Ready {
+        encode_server_event(&ServerEvent::Ready {
             topic: &topic,
             client_id: &client_id,
         })?,
@@ -146,7 +147,7 @@ async fn connection_loop(
                 message = client_rx.recv() => {
                     match message {
                         Some(message) => {
-                            if ws_sender.send(message).await.is_err() {
+                            if ws_sender.send(message.into_ws_message()).await.is_err() {
                                 return Err(anyhow::anyhow!("failed to send websocket message"));
                             }
                             writer_state.metrics.message_out();
@@ -165,7 +166,7 @@ async fn connection_loop(
         loop {
             match topic_rx.recv().await {
                 Ok(raw) => {
-                    if !send_json(&fanout_tx, &raw, &fanout_state) {
+                    if !send_encoded(&fanout_tx, raw, &fanout_state) {
                         return Err(anyhow::anyhow!("client send queue is full or closed"));
                     }
                 }
@@ -198,10 +199,10 @@ async fn connection_loop(
                             if !rate_limiter.allow() {
                                 reader_state.metrics.protocol_error();
                                 send_error(&reader_tx, "rate_limited", "message rate limit exceeded", &reader_state);
-                                let _ = reader_tx.try_send(Message::Close(Some(CloseFrame {
+                                let _ = reader_tx.try_send(OutboundMessage::Close {
                                     code: axum::extract::ws::close_code::POLICY,
-                                    reason: "rate limit exceeded".into(),
-                                })));
+                                    reason: "rate limit exceeded",
+                                });
                                 break;
                             }
                             if text.len() > reader_state.config.max_text_bytes {
@@ -211,12 +212,21 @@ async fn connection_loop(
                             }
                             handle_text(&reader_state, &reader_tx, &reader_topic, &reader_client_id, &text).await;
                         }
-                        Some(Ok(Message::Binary(_))) => {
-                            reader_state.metrics.protocol_error();
-                            send_error(&reader_tx, "unsupported_message", "binary messages are not supported", &reader_state);
+                        Some(Ok(Message::Binary(raw))) => {
+                            reader_state.metrics.message_in();
+                            if !rate_limiter.allow() {
+                                reader_state.metrics.protocol_error();
+                                send_error(&reader_tx, "rate_limited", "message rate limit exceeded", &reader_state);
+                                let _ = reader_tx.try_send(OutboundMessage::Close {
+                                    code: axum::extract::ws::close_code::POLICY,
+                                    reason: "rate limit exceeded",
+                                });
+                                break;
+                            }
+                            handle_binary(&reader_state, &reader_tx, &reader_topic, &reader_client_id, &raw).await;
                         }
                         Some(Ok(Message::Ping(payload))) => {
-                            let _ = reader_tx.try_send(Message::Pong(payload));
+                            let _ = reader_tx.try_send(OutboundMessage::Pong(payload));
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close(_))) | None => break,
@@ -224,10 +234,10 @@ async fn connection_loop(
                     }
                 }
                 _ = sleep(idle_timeout) => {
-                    let _ = reader_tx.try_send(Message::Close(Some(CloseFrame {
+                    let _ = reader_tx.try_send(OutboundMessage::Close {
                         code: axum::extract::ws::close_code::NORMAL,
-                        reason: "idle timeout".into(),
-                    })));
+                        reason: "idle timeout",
+                    });
                     break;
                 }
             }
@@ -272,17 +282,59 @@ async fn connection_loop(
 
 async fn handle_text(
     state: &SharedState,
-    client_tx: &mpsc::Sender<Message>,
+    client_tx: &mpsc::Sender<OutboundMessage>,
     default_topic: &str,
     client_id: &str,
     text: &str,
 ) {
-    match parse_client_event(text) {
-        Ok(ClientEvent::Publish {
+    match parse_client_event_text(text) {
+        Ok(event) => handle_client_event(state, client_tx, default_topic, client_id, event).await,
+        Err(_) => {
+            state.metrics.protocol_error();
+            send_error(
+                client_tx,
+                "invalid_json",
+                "message must match the websocket JSON protocol",
+                state,
+            );
+        }
+    }
+}
+
+async fn handle_binary(
+    state: &SharedState,
+    client_tx: &mpsc::Sender<OutboundMessage>,
+    default_topic: &str,
+    client_id: &str,
+    raw: &[u8],
+) {
+    match parse_client_event_binary(raw) {
+        Ok(event) => handle_client_event(state, client_tx, default_topic, client_id, event).await,
+        Err(_) => {
+            state.metrics.protocol_error();
+            send_error(
+                client_tx,
+                "invalid_msgpack",
+                "binary message must match the websocket MessagePack protocol",
+                state,
+            );
+        }
+    }
+}
+
+async fn handle_client_event(
+    state: &SharedState,
+    client_tx: &mpsc::Sender<OutboundMessage>,
+    default_topic: &str,
+    client_id: &str,
+    event: ClientEvent,
+) {
+    match event {
+        ClientEvent::Publish {
             topic,
             request_id,
             payload,
-        }) => {
+        } => {
             let topic = topic
                 .as_deref()
                 .map(normalize_topic)
@@ -294,7 +346,7 @@ async fn handle_text(
                 payload: &payload,
             }) {
                 Ok(encoded) => {
-                    let receivers = state.publish(&topic, Arc::<str>::from(encoded));
+                    let receivers = state.publish(&topic, encoded);
                     if receivers == 0 {
                         state.metrics.message_dropped();
                     }
@@ -310,18 +362,18 @@ async fn handle_text(
                 }
             }
         }
-        Ok(ClientEvent::Direct {
+        ClientEvent::Direct {
             to,
             request_id,
             payload,
-        }) => match encode_server_event(&ServerEvent::DirectMessage {
+        } => match encode_server_event(&ServerEvent::DirectMessage {
             from: client_id,
             to: &to,
             request_id: request_id.as_deref(),
             payload: &payload,
         }) {
             Ok(encoded) => {
-                if !state.send_to_client(&to, Arc::<str>::from(encoded)) {
+                if !state.send_to_client(&to, encoded) {
                     state.metrics.message_dropped();
                     send_error(
                         client_tx,
@@ -341,40 +393,40 @@ async fn handle_text(
                 );
             }
         },
-        Ok(ClientEvent::Ping {
+        ClientEvent::Ping {
             request_id,
             payload,
-        }) => {
+        } => {
             match encode_server_event(&ServerEvent::Pong {
                 request_id: request_id.as_deref(),
                 payload: payload.as_ref(),
             }) {
                 Ok(encoded) => {
-                    let _ = send_json(client_tx, &encoded, state);
+                    let _ = send_encoded(client_tx, encoded, state);
                 }
                 Err(_) => send_error(client_tx, "encode_failed", "failed to encode pong", state),
             }
         }
-        Err(_) => {
-            state.metrics.protocol_error();
-            send_error(
-                client_tx,
-                "invalid_json",
-                "message must match the websocket JSON protocol",
-                state,
-            );
-        }
     }
 }
 
-fn send_error(client_tx: &mpsc::Sender<Message>, code: &str, message: &str, state: &SharedState) {
+fn send_error(
+    client_tx: &mpsc::Sender<OutboundMessage>,
+    code: &str,
+    message: &str,
+    state: &SharedState,
+) {
     if let Ok(encoded) = encode_server_event(&ServerEvent::Error { code, message }) {
-        send_json(client_tx, &encoded, state);
+        let _ = send_encoded(client_tx, encoded, state);
     }
 }
 
-fn send_json(client_tx: &mpsc::Sender<Message>, text: &str, state: &SharedState) -> bool {
-    match client_tx.try_send(Message::Text(text.to_owned())) {
+fn send_encoded(
+    client_tx: &mpsc::Sender<OutboundMessage>,
+    message: bytes::Bytes,
+    state: &SharedState,
+) -> bool {
+    match client_tx.try_send(OutboundMessage::Binary(message)) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
             state.metrics.message_dropped();

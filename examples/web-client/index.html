@@ -202,10 +202,10 @@
       </section>
 
       <section class="panel">
-          <label>
-            要发布的 payload JSON
-            <textarea id="payload">{"text":"hello from browser","ts":0}</textarea>
-          </label>
+        <label>
+          要发布的 payload JSON
+          <textarea id="payload">{"text":"hello from browser","ts":0}</textarea>
+        </label>
         <div class="grid" style="margin-top: 12px">
           <label>
             私聊目标 Client ID
@@ -302,6 +302,7 @@
 
         const url = buildUrl();
         socket = new WebSocket(url);
+        socket.binaryType = "arraybuffer";
         appendLog("INFO", `connecting ${url}`);
 
         socket.addEventListener("open", () => {
@@ -311,9 +312,16 @@
 
         socket.addEventListener("message", (event) => {
           try {
-            appendLog("RECV", JSON.parse(event.data));
-          } catch {
-            appendLog("RECV", event.data);
+            if (event.data instanceof ArrayBuffer) {
+              appendLog("RECV", decodeMsgpack(new Uint8Array(event.data)));
+            } else {
+              appendLog("RECV", JSON.parse(event.data));
+            }
+          } catch (err) {
+            appendLog("RECV", {
+              error: `无法解析服务端消息: ${err.message}`,
+              raw_type: Object.prototype.toString.call(event.data),
+            });
           }
         });
 
@@ -382,6 +390,139 @@
       els.clearBtn.addEventListener("click", () => {
         els.log.textContent = "";
       });
+
+      function decodeMsgpack(bytes) {
+        let offset = 0;
+        const decoder = new TextDecoder();
+
+        function ensure(length) {
+          if (offset + length > bytes.length) {
+            throw new Error("MessagePack 数据不完整");
+          }
+        }
+
+        function read(length) {
+          ensure(length);
+          const slice = bytes.slice(offset, offset + length);
+          offset += length;
+          return slice;
+        }
+
+        function readU8() {
+          ensure(1);
+          return bytes[offset++];
+        }
+
+        function readU16() {
+          const view = read(2);
+          return (view[0] << 8) | view[1];
+        }
+
+        function readU32() {
+          const view = read(4);
+          return (
+            view[0] * 2 ** 24 +
+            (view[1] << 16) +
+            (view[2] << 8) +
+            view[3]
+          );
+        }
+
+        function readU64() {
+          const hi = readU32();
+          const lo = readU32();
+          return hi * 2 ** 32 + lo;
+        }
+
+        function readI8() {
+          const value = readU8();
+          return value > 0x7f ? value - 0x100 : value;
+        }
+
+        function readI16() {
+          const value = readU16();
+          return value > 0x7fff ? value - 0x10000 : value;
+        }
+
+        function readI32() {
+          return readU32() | 0;
+        }
+
+        function readString(length) {
+          return decoder.decode(read(length));
+        }
+
+        function decodeValue() {
+          const marker = readU8();
+
+          if (marker <= 0x7f) return marker;
+          if (marker >= 0xe0) return marker - 0x100;
+          if (marker >= 0xa0 && marker <= 0xbf) return readString(marker & 0x1f);
+          if (marker >= 0x90 && marker <= 0x9f) return decodeArray(marker & 0x0f);
+          if (marker >= 0x80 && marker <= 0x8f) return decodeMap(marker & 0x0f);
+
+          switch (marker) {
+            case 0xc0:
+              return null;
+            case 0xc2:
+              return false;
+            case 0xc3:
+              return true;
+            case 0xcc:
+              return readU8();
+            case 0xcd:
+              return readU16();
+            case 0xce:
+              return readU32();
+            case 0xcf:
+              return readU64();
+            case 0xd0:
+              return readI8();
+            case 0xd1:
+              return readI16();
+            case 0xd2:
+              return readI32();
+            case 0xd9:
+              return readString(readU8());
+            case 0xda:
+              return readString(readU16());
+            case 0xdb:
+              return readString(readU32());
+            case 0xdc:
+              return decodeArray(readU16());
+            case 0xdd:
+              return decodeArray(readU32());
+            case 0xde:
+              return decodeMap(readU16());
+            case 0xdf:
+              return decodeMap(readU32());
+            default:
+              throw new Error(`暂不支持的 MessagePack marker: 0x${marker.toString(16)}`);
+          }
+        }
+
+        function decodeArray(length) {
+          const value = [];
+          for (let index = 0; index < length; index += 1) {
+            value.push(decodeValue());
+          }
+          return value;
+        }
+
+        function decodeMap(length) {
+          const value = {};
+          for (let index = 0; index < length; index += 1) {
+            value[decodeValue()] = decodeValue();
+          }
+          return value;
+        }
+
+        const value = decodeValue();
+        if (offset !== bytes.length) {
+          throw new Error("MessagePack 数据尾部存在未消费字节");
+        }
+        return value;
+      }
 
       setConnected(false);
       appendLog("INFO", "先启动服务端：cargo run --release");

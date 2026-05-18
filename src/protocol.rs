@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -49,10 +50,14 @@ pub enum ServerEvent<'a> {
     },
 }
 
-pub fn parse_client_event(raw: &str) -> serde_json::Result<ClientEvent> {
+pub fn parse_client_event_text(raw: &str) -> serde_json::Result<ClientEvent> {
     serde_json::from_str(raw)
 }
 
-pub fn encode_server_event(event: &ServerEvent<'_>) -> serde_json::Result<String> {
-    serde_json::to_string(event)
+pub fn parse_client_event_binary(raw: &[u8]) -> Result<ClientEvent, rmp_serde::decode::Error> {
+    rmp_serde::from_slice(raw)
+}
+
+pub fn encode_server_event(event: &ServerEvent<'_>) -> Result<Bytes, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(event).map(Bytes::from)
 }

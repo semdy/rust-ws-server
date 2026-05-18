@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use rust_ws_server::{config::Config, server, state::AppState};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -44,6 +44,26 @@ fn text_message(value: serde_json::Value) -> Message {
     Message::Text(value.to_string().into())
 }
 
+fn binary_message(value: serde_json::Value) -> Message {
+    Message::Binary(rmp_serde::to_vec_named(&value).unwrap().into())
+}
+
+async fn next_server_event<S>(socket: &mut S) -> Value
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match frame {
+        Message::Binary(bytes) => rmp_serde::from_slice(&bytes).unwrap(),
+        Message::Text(text) => serde_json::from_str(&text).unwrap(),
+        other => panic!("unexpected frame: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn broadcasts_messages_to_topic_subscribers() {
     let (addr, handle) = spawn_server(10).await;
@@ -53,8 +73,8 @@ async fn broadcasts_messages_to_topic_subscribers() {
         .await
         .unwrap();
 
-    let _ = a.next().await.unwrap().unwrap();
-    let _ = b.next().await.unwrap().unwrap();
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
 
     a.send(text_message(
         json!({"kind":"publish","request_id":"r1","payload":{"text":"hello"}}),
@@ -62,15 +82,9 @@ async fn broadcasts_messages_to_topic_subscribers() {
     .await
     .unwrap();
 
-    let received = tokio::time::timeout(Duration::from_secs(2), b.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    assert!(received.contains("\"kind\":\"message\""));
-    assert!(received.contains("\"hello\""));
+    let received = next_server_event(&mut b).await;
+    assert_eq!(received["kind"], "message");
+    assert_eq!(received["payload"]["text"], "hello");
 
     handle.abort();
 }
@@ -88,9 +102,9 @@ async fn sends_direct_messages_to_one_client() {
         .await
         .unwrap();
 
-    let _ = a.next().await.unwrap().unwrap();
-    let _ = b.next().await.unwrap().unwrap();
-    let _ = c.next().await.unwrap().unwrap();
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
+    let _ = next_server_event(&mut c).await;
 
     a.send(text_message(
         json!({"kind":"direct","to":"b","request_id":"d1","payload":{"text":"secret"}}),
@@ -98,17 +112,11 @@ async fn sends_direct_messages_to_one_client() {
     .await
     .unwrap();
 
-    let received = tokio::time::timeout(Duration::from_secs(2), b.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
-    assert!(received.contains("\"kind\":\"direct_message\""));
-    assert!(received.contains("\"from\":\"a\""));
-    assert!(received.contains("\"to\":\"b\""));
-    assert!(received.contains("\"secret\""));
+    let received = next_server_event(&mut b).await;
+    assert_eq!(received["kind"], "direct_message");
+    assert_eq!(received["from"], "a");
+    assert_eq!(received["to"], "b");
+    assert_eq!(received["payload"]["text"], "secret");
 
     let not_received = tokio::time::timeout(Duration::from_millis(100), c.next()).await;
     assert!(not_received.is_err());
@@ -135,7 +143,7 @@ async fn rate_limits_noisy_clients() {
     let (mut client, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=noisy"))
         .await
         .unwrap();
-    let _ = client.next().await.unwrap().unwrap();
+    let _ = next_server_event(&mut client).await;
 
     for seq in 0..3 {
         client
@@ -154,8 +162,12 @@ async fn rate_limits_noisy_clients() {
         else {
             break;
         };
-        let frame = frame.unwrap();
-        if frame.to_string().contains("rate_limited") {
+        let value = match frame.unwrap() {
+            Message::Binary(bytes) => rmp_serde::from_slice::<Value>(&bytes).unwrap(),
+            Message::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
+            _ => continue,
+        };
+        if value["code"] == "rate_limited" {
             saw_rate_limit = true;
             break;
         }
@@ -171,10 +183,36 @@ async fn rejects_connections_over_limit() {
     let (mut first, _) = connect_async(format!("ws://{addr}/ws?topic=limit"))
         .await
         .unwrap();
-    let _ = first.next().await.unwrap().unwrap();
+    let _ = next_server_event(&mut first).await;
 
     let second = connect_async(format!("ws://{addr}/ws?topic=limit")).await;
     assert!(second.is_err());
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn accepts_msgpack_client_messages() {
+    let (addr, handle) = spawn_server(10).await;
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
+        .await
+        .unwrap();
+    let (mut b, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=b"))
+        .await
+        .unwrap();
+
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
+
+    a.send(binary_message(
+        json!({"kind":"publish","request_id":"r1","payload":{"text":"hello msgpack"}}),
+    ))
+    .await
+    .unwrap();
+
+    let received = next_server_event(&mut b).await;
+    assert_eq!(received["kind"], "message");
+    assert_eq!(received["payload"]["text"], "hello msgpack");
 
     handle.abort();
 }
