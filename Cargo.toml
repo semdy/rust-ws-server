@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
 futures-util = "0.3"
 humantime = "2"
 humantime-serde = "1"

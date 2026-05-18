@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -116,11 +119,9 @@ async fn connection_loop(
 ) -> anyhow::Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (client_tx, mut client_rx) = mpsc::channel::<Message>(state.config.client_queue_capacity);
-    let mut topic_rx = state.subscribe(&topic).await;
+    let mut topic_rx = state.subscribe(&topic);
     let connection_id = state.next_connection_id();
-    state
-        .register_client(client_id.clone(), connection_id, client_tx.clone())
-        .await;
+    state.register_client(client_id.clone(), connection_id, client_tx.clone());
 
     send_json(
         &client_tx,
@@ -184,12 +185,25 @@ async fn connection_loop(
     let reader_topic = topic.clone();
     let reader_client_id = client_id.clone();
     let reader = tokio::spawn(async move {
+        let mut rate_limiter = RateLimiter::new(
+            reader_state.config.max_messages_per_second,
+            reader_state.config.message_burst,
+        );
         loop {
             tokio::select! {
                 frame = ws_receiver.next() => {
                     match frame {
                         Some(Ok(Message::Text(text))) => {
                             reader_state.metrics.message_in();
+                            if !rate_limiter.allow() {
+                                reader_state.metrics.protocol_error();
+                                send_error(&reader_tx, "rate_limited", "message rate limit exceeded", &reader_state);
+                                let _ = reader_tx.try_send(Message::Close(Some(CloseFrame {
+                                    code: axum::extract::ws::close_code::POLICY,
+                                    reason: "rate limit exceeded".into(),
+                                })));
+                                break;
+                            }
                             if text.len() > reader_state.config.max_text_bytes {
                                 reader_state.metrics.protocol_error();
                                 send_error(&reader_tx, "message_too_large", "text message exceeds configured limit", &reader_state);
@@ -237,7 +251,7 @@ async fn connection_loop(
     let _ = reader.await;
     let _ = fanout.await;
     let _ = writer.await;
-    state.unregister_client(&client_id, connection_id).await;
+    state.unregister_client(&client_id, connection_id);
     result
 }
 
@@ -265,7 +279,7 @@ async fn handle_text(
                 payload: &payload,
             }) {
                 Ok(encoded) => {
-                    let receivers = state.publish(&topic, Arc::<str>::from(encoded)).await;
+                    let receivers = state.publish(&topic, Arc::<str>::from(encoded));
                     if receivers == 0 {
                         state.metrics.message_dropped();
                     }
@@ -292,7 +306,7 @@ async fn handle_text(
             payload: &payload,
         }) {
             Ok(encoded) => {
-                if !state.send_to_client(&to, Arc::<str>::from(encoded)).await {
+                if !state.send_to_client(&to, Arc::<str>::from(encoded)) {
                     state.metrics.message_dropped();
                     send_error(
                         client_tx,
@@ -367,6 +381,48 @@ fn task_result(
         Err(err) if err.is_cancelled() => Ok(()),
         Err(err) => Err(anyhow::anyhow!("{task_name} task failed: {err}")),
     }
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    capacity: f64,
+    tokens: f64,
+    refill_per_second: f64,
+    last_refill: Instant,
+}
+
+impl RateLimiter {
+    fn new(refill_per_second: u32, burst: u32) -> Self {
+        let capacity = burst.max(1) as f64;
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_second: refill_per_second.max(1) as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill);
+        self.last_refill = now;
+        self.tokens =
+            (self.tokens + tokens_to_add(elapsed, self.refill_per_second)).min(self.capacity);
+    }
+}
+
+fn tokens_to_add(elapsed: Duration, refill_per_second: f64) -> f64 {
+    elapsed.as_secs_f64() * refill_per_second
 }
 
 fn normalize_topic(topic: &str) -> String {

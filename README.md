@@ -7,6 +7,8 @@
 - 连接数上限控制，避免文件描述符和内存被打爆
 - 每连接有界写队列，慢消费者不会拖垮全局
 - 多主题广播，避免所有消息走单一全局队列
+- DashMap 管理在线客户端和主题，降低热点锁竞争
+- 每连接消息速率限制，异常客户端会被主动关闭
 - Ping/Pong 与空闲超时，主动清理僵尸连接
 - `/healthz`、`/readyz`、`/metrics` 运维端点
 - JSON 协议、结构化日志、优雅退出
@@ -33,6 +35,8 @@ WS_BIND_ADDR=0.0.0.0:8080 \
 WS_MAX_CONNECTIONS=10000 \
 WS_CLIENT_QUEUE_CAPACITY=256 \
 WS_TOPIC_CHANNEL_CAPACITY=1024 \
+WS_MAX_MESSAGES_PER_SECOND=100 \
+WS_MESSAGE_BURST=200 \
 WS_IDLE_TIMEOUT=60s \
 WS_HEARTBEAT_INTERVAL=20s \
 cargo run --release
@@ -143,5 +147,5 @@ socket.send(JSON.stringify({
 - TLS 终止，例如 Nginx、Envoy、ALB 或 rustls
 - 鉴权与租户隔离，例如 JWT、mTLS、签名 URL
 - 多实例广播，例如 Redis Pub/Sub、NATS、Kafka 或自研网关层
-- 限流与黑名单，避免单连接刷消息
+- IP 级限流、黑名单和风控，配合当前连接级消息限流
 - Prometheus/Grafana 告警规则和压测基线

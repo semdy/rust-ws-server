@@ -20,6 +20,12 @@ pub struct Config {
     #[arg(long, env = "WS_MAX_TEXT_BYTES", default_value_t = 64 * 1024)]
     pub max_text_bytes: usize,
 
+    #[arg(long, env = "WS_MAX_MESSAGES_PER_SECOND", default_value_t = 100)]
+    pub max_messages_per_second: u32,
+
+    #[arg(long, env = "WS_MESSAGE_BURST", default_value_t = 200)]
+    pub message_burst: u32,
+
     #[arg(long, env = "WS_IDLE_TIMEOUT", default_value = "60s", value_parser = humantime::parse_duration)]
     pub idle_timeout: Duration,
 

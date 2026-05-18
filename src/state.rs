@@ -1,13 +1,11 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use axum::extract::ws::Message;
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use dashmap::DashMap;
+use tokio::sync::{Semaphore, broadcast, mpsc};
 
 use crate::{config::Config, metrics::Metrics};
 
@@ -18,8 +16,8 @@ pub struct AppState {
     pub config: Config,
     pub metrics: Metrics,
     pub connection_limit: Arc<Semaphore>,
-    topics: RwLock<HashMap<String, broadcast::Sender<Arc<str>>>>,
-    clients: RwLock<HashMap<String, ClientHandle>>,
+    topics: DashMap<String, broadcast::Sender<Arc<str>>>,
+    clients: DashMap<String, ClientHandle>,
     next_connection_id: AtomicU64,
 }
 
@@ -35,8 +33,8 @@ impl AppState {
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             config,
             metrics: Metrics::default(),
-            topics: RwLock::new(HashMap::new()),
-            clients: RwLock::new(HashMap::new()),
+            topics: DashMap::new(),
+            clients: DashMap::new(),
             next_connection_id: AtomicU64::new(1),
         })
     }
@@ -45,13 +43,13 @@ impl AppState {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub async fn register_client(
+    pub fn register_client(
         &self,
         client_id: String,
         connection_id: u64,
         sender: mpsc::Sender<Message>,
     ) {
-        self.clients.write().await.insert(
+        self.clients.insert(
             client_id,
             ClientHandle {
                 connection_id,
@@ -60,21 +58,19 @@ impl AppState {
         );
     }
 
-    pub async fn unregister_client(&self, client_id: &str, connection_id: u64) {
-        let mut clients = self.clients.write().await;
-        if clients
+    pub fn unregister_client(&self, client_id: &str, connection_id: u64) {
+        if self
+            .clients
             .get(client_id)
             .is_some_and(|handle| handle.connection_id == connection_id)
         {
-            clients.remove(client_id);
+            self.clients.remove(client_id);
         }
     }
 
-    pub async fn send_to_client(&self, client_id: &str, message: Arc<str>) -> bool {
+    pub fn send_to_client(&self, client_id: &str, message: Arc<str>) -> bool {
         let sender = self
             .clients
-            .read()
-            .await
             .get(client_id)
             .map(|handle| handle.sender.clone());
 
@@ -84,22 +80,17 @@ impl AppState {
         }
     }
 
-    pub async fn publish(&self, topic: &str, message: Arc<str>) -> usize {
-        let sender = self.topic_sender(topic).await;
+    pub fn publish(&self, topic: &str, message: Arc<str>) -> usize {
+        let sender = self.topic_sender(topic);
         sender.send(message).unwrap_or(0)
     }
 
-    pub async fn subscribe(&self, topic: &str) -> broadcast::Receiver<Arc<str>> {
-        self.topic_sender(topic).await.subscribe()
+    pub fn subscribe(&self, topic: &str) -> broadcast::Receiver<Arc<str>> {
+        self.topic_sender(topic).subscribe()
     }
 
-    async fn topic_sender(&self, topic: &str) -> broadcast::Sender<Arc<str>> {
-        if let Some(sender) = self.topics.read().await.get(topic).cloned() {
-            return sender;
-        }
-
-        let mut topics = self.topics.write().await;
-        topics
+    fn topic_sender(&self, topic: &str) -> broadcast::Sender<Arc<str>> {
+        self.topics
             .entry(topic.to_owned())
             .or_insert_with(|| broadcast::channel(self.config.topic_channel_capacity).0)
             .clone()
