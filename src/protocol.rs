@@ -9,6 +9,11 @@ pub enum ClientEvent {
         request_id: Option<String>,
         payload: Value,
     },
+    Direct {
+        to: String,
+        request_id: Option<String>,
+        payload: Value,
+    },
     Ping {
         request_id: Option<String>,
         payload: Option<Value>,
@@ -24,6 +29,13 @@ pub enum ServerEvent<'a> {
     },
     Message {
         topic: &'a str,
+        from: &'a str,
+        request_id: Option<&'a str>,
+        payload: &'a Value,
+    },
+    DirectMessage {
+        from: &'a str,
+        to: &'a str,
         request_id: Option<&'a str>,
         payload: &'a Value,
     },

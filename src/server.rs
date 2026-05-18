@@ -117,6 +117,10 @@ async fn connection_loop(
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (client_tx, mut client_rx) = mpsc::channel::<Message>(state.config.client_queue_capacity);
     let mut topic_rx = state.subscribe(&topic).await;
+    let connection_id = state.next_connection_id();
+    state
+        .register_client(client_id.clone(), connection_id, client_tx.clone())
+        .await;
 
     send_json(
         &client_tx,
@@ -181,7 +185,7 @@ async fn connection_loop(
                                 send_error(&client_tx, "message_too_large", "text message exceeds configured limit", &state);
                                 continue;
                             }
-                            handle_text(&state, &client_tx, &topic, &text).await;
+                            handle_text(&state, &client_tx, &topic, &client_id, &text).await;
                         }
                         Some(Ok(Message::Binary(_))) => {
                             state.metrics.protocol_error();
@@ -212,6 +216,7 @@ async fn connection_loop(
     writer.abort();
     let _ = fanout.await;
     let _ = writer.await;
+    state.unregister_client(&client_id, connection_id).await;
     reader_result
 }
 
@@ -219,6 +224,7 @@ async fn handle_text(
     state: &SharedState,
     client_tx: &mpsc::Sender<Message>,
     default_topic: &str,
+    client_id: &str,
     text: &str,
 ) {
     match parse_client_event(text) {
@@ -233,6 +239,7 @@ async fn handle_text(
                 .unwrap_or_else(|| default_topic.to_owned());
             match encode_server_event(&ServerEvent::Message {
                 topic: &topic,
+                from: client_id,
                 request_id: request_id.as_deref(),
                 payload: &payload,
             }) {
@@ -253,6 +260,37 @@ async fn handle_text(
                 }
             }
         }
+        Ok(ClientEvent::Direct {
+            to,
+            request_id,
+            payload,
+        }) => match encode_server_event(&ServerEvent::DirectMessage {
+            from: client_id,
+            to: &to,
+            request_id: request_id.as_deref(),
+            payload: &payload,
+        }) {
+            Ok(encoded) => {
+                if !state.send_to_client(&to, Arc::<str>::from(encoded)).await {
+                    state.metrics.message_dropped();
+                    send_error(
+                        client_tx,
+                        "client_not_found",
+                        "target client is not online",
+                        state,
+                    );
+                }
+            }
+            Err(_) => {
+                state.metrics.protocol_error();
+                send_error(
+                    client_tx,
+                    "encode_failed",
+                    "failed to encode direct message",
+                    state,
+                );
+            }
+        },
         Ok(ClientEvent::Ping {
             request_id,
             payload,

@@ -58,6 +58,22 @@ cargo run --release
 {"kind":"ping","request_id":"2","payload":null}
 ```
 
+发送点对点私聊消息，`to` 是目标连接的 `client_id`：
+
+```json
+{"kind":"direct","to":"bob","request_id":"3","payload":{"text":"hello bob"}}
+```
+
+服务端消息示例：
+
+```json
+{"kind":"message","topic":"public","from":"alice","request_id":"1","payload":{"text":"hello group"}}
+```
+
+```json
+{"kind":"direct_message","from":"alice","to":"bob","request_id":"3","payload":{"text":"hello bob"}}
+```
+
 ## Web 客户端示例
 
 已提供一个浏览器调用示例：
@@ -82,7 +98,14 @@ cargo run --release
 ws://127.0.0.1:8080/ws?topic=public&client_id=web-demo
 ```
 
-页面里可以发送：
+页面里支持群聊和点对点私聊。测试私聊时可以打开两个浏览器标签页：
+
+- 标签页 A：`client_id=alice`
+- 标签页 B：`client_id=bob`
+
+两个标签页连接同一个服务端后，A 选择“私聊”并把目标设为 `bob`，只有 B 会收到 `direct_message`。
+
+页面里可以发送群聊：
 
 ```js
 socket.send(JSON.stringify({
@@ -92,12 +115,23 @@ socket.send(JSON.stringify({
 }));
 ```
 
+也可以发送私聊：
+
+```js
+socket.send(JSON.stringify({
+  kind: "direct",
+  to: "bob",
+  request_id: "web-2",
+  payload: { text: "hello bob" }
+}));
+```
+
 也可以发应用层 ping：
 
 ```js
 socket.send(JSON.stringify({
   kind: "ping",
-  request_id: "web-2",
+  request_id: "web-3",
   payload: { from: "browser" }
 }));
 ```

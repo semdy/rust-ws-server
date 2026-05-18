@@ -61,12 +61,14 @@
       }
 
       input,
+      select,
       textarea,
       button {
         font: inherit;
       }
 
       input,
+      select,
       textarea {
         width: 100%;
         border: 1px solid #cfd7df;
@@ -200,12 +202,25 @@
       </section>
 
       <section class="panel">
-        <label>
-          要发布的 payload JSON
-          <textarea id="payload">{"text":"hello from browser","ts":0}</textarea>
-        </label>
+          <label>
+            要发布的 payload JSON
+            <textarea id="payload">{"text":"hello from browser","ts":0}</textarea>
+          </label>
+        <div class="grid" style="margin-top: 12px">
+          <label>
+            私聊目标 Client ID
+            <input id="targetClientId" value="bob" />
+          </label>
+          <label>
+            发送模式
+            <select id="mode">
+              <option value="group">群聊：发送到当前 topic</option>
+              <option value="direct">私聊：发送到目标 client_id</option>
+            </select>
+          </label>
+        </div>
         <div class="actions">
-          <button id="sendBtn" disabled>发布到当前主题</button>
+          <button id="sendBtn" disabled>发送</button>
           <button id="sendRoomBtn" class="secondary" disabled>发布到 room-a</button>
         </div>
       </section>
@@ -227,6 +242,8 @@
         pingBtn: document.querySelector("#pingBtn"),
         clearBtn: document.querySelector("#clearBtn"),
         payload: document.querySelector("#payload"),
+        targetClientId: document.querySelector("#targetClientId"),
+        mode: document.querySelector("#mode"),
         sendBtn: document.querySelector("#sendBtn"),
         sendRoomBtn: document.querySelector("#sendRoomBtn"),
         log: document.querySelector("#log"),
@@ -330,11 +347,20 @@
           if (payload && typeof payload === "object") {
             payload.ts = Date.now();
           }
-          sendJson({
-            kind: "publish",
-            request_id: `web-${++requestSeq}`,
-            payload,
-          });
+          if (els.mode.value === "direct") {
+            sendJson({
+              kind: "direct",
+              to: els.targetClientId.value.trim(),
+              request_id: `web-${++requestSeq}`,
+              payload,
+            });
+          } else {
+            sendJson({
+              kind: "publish",
+              request_id: `web-${++requestSeq}`,
+              payload,
+            });
+          }
         } catch (err) {
           appendLog("ERR", `payload JSON 解析失败: ${err.message}`);
         }
