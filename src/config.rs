@@ -34,4 +34,32 @@ pub struct Config {
 
     #[arg(long, env = "WS_JSON_LOGS", default_value_t = false)]
     pub json_logs: bool,
+
+    /// HMAC secret for JWT verification (HS256). When set, enables JWT auth.
+    #[arg(long, env = "WS_JWT_SECRET")]
+    pub jwt_secret: Option<String>,
+
+    /// PEM-encoded public key for JWT verification (RS256/EdDSA). Alternative to HS256 secret.
+    #[arg(long, env = "WS_JWT_PUBLIC_KEY")]
+    pub jwt_public_key: Option<String>,
+
+    /// Optional expected `iss` claim; if set, tokens with mismatched issuer are rejected.
+    #[arg(long, env = "WS_JWT_ISSUER")]
+    pub jwt_issuer: Option<String>,
+
+    /// Max concurrent websocket connections per client IP. None = unlimited.
+    #[arg(long, env = "WS_IP_MAX_CONCURRENT")]
+    pub ip_max_concurrent: Option<usize>,
+
+    /// Per-IP new-connection rate limit (connections per second). None = unlimited.
+    #[arg(long, env = "WS_IP_CONNECTION_RATE")]
+    pub ip_connection_rate: Option<u32>,
+
+    /// Burst size for per-IP connection rate limiter. Defaults to the rate when unset.
+    #[arg(long, env = "WS_IP_RATE_BURST")]
+    pub ip_rate_burst: Option<u32>,
+
+    /// Trust X-Forwarded-For / X-Real-IP headers for client IP. Only enable behind a trusted reverse proxy.
+    #[arg(long, env = "WS_TRUST_PROXY_HEADERS", default_value_t = false)]
+    pub trust_proxy_headers: bool,
 }

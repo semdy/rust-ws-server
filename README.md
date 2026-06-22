@@ -41,10 +41,54 @@ WS_MAX_MESSAGES_PER_SECOND=100 \
 WS_MESSAGE_BURST=200 \
 WS_IDLE_TIMEOUT=60s \
 WS_HEARTBEAT_INTERVAL=20s \
+WS_JWT_SECRET=your-hmac-secret \
+WS_IP_MAX_CONCURRENT=200 \
+WS_IP_CONNECTION_RATE=20 \
+WS_IP_RATE_BURST=40 \
+WS_TRUST_PROXY_HEADERS=true \
 cargo run --release
 ```
 
+### 鉴权（JWT）
+
+配置 `WS_JWT_SECRET`（HS256）或 `WS_JWT_PUBLIC_KEY`（RS256/EdDSA PEM）即启用 JWT 鉴权。
+都不配则鉴权关闭（dev 模式，启动时会有 warn 日志）。
+
+握手时通过 query 参数 `?token=<jwt>` 传递 token。JWT payload 约定：
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `sub` | 是 | 客户端身份，作为可信 `client_id`（覆盖 query 里的 `client_id`） |
+| `tenant_id` | 否 | 租户 ID。缺失时归入 `default` 租户 |
+| `exp` | 是 | 过期时间，强制校验 |
+| `iss` | 否 | 可选签发方；配置 `WS_JWT_ISSUER` 后才校验 |
+
+### 多租户
+
+JWT 中携带 `tenant_id` 时自动启用租户隔离：
+
+- 同名主题在不同租户间互不可见（`t1:room-a` 与 `t2:room-a` 物理隔离）
+- `direct` 私聊限定同租户，跨租户发送按 `client_not_found` 处理（不泄露目标存在性）
+- 同一 `client_id` 可在不同租户中并存
+
+### IP 限流
+
+| 环境变量 | 说明 |
+|---------|------|
+| `WS_IP_MAX_CONCURRENT` | 单 IP 最大并发连接数，不配则不限 |
+| `WS_IP_CONNECTION_RATE` | 单 IP 每秒新建连接数上限，不配则不限 |
+| `WS_IP_RATE_BURST` | 令牌桶突发容量，缺省取 `WS_IP_CONNECTION_RATE` |
+| `WS_TRUST_PROXY_HEADERS` | 是否信任 `X-Forwarded-For` / `X-Real-IP`。**仅在可信反代后开启**，否则客户端可伪造 IP |
+
 ## 客户端消息
+
+开启 JWT 鉴权后，握手 URL 必须带 `?token=<jwt>`，例如：
+
+```text
+ws://127.0.0.1:8080/ws?topic=public&token=eyJhbGciOiJIUzI1NiIs...
+```
+
+`client_id` 不再由 query 提供，而是从 JWT 的 `sub` 字段派生。鉴权关闭时（未配置 `WS_JWT_SECRET`），仍可通过 `?client_id=` 指定。
 
 客户端入站兼容两种格式：
 
@@ -162,10 +206,40 @@ socket.send(JSON.stringify({
 
 ## 生产提醒
 
-这个工程刻意把“单机高性能 WebSocket 核心”做好，但生产环境通常还需要接入：
+这个工程刻意把“单机高性能 WebSocket 核心”做好，已内置：
 
-- TLS 终止，例如 Nginx、Envoy、ALB 或 rustls
-- 鉴权与租户隔离，例如 JWT、mTLS、签名 URL
-- 多实例广播，例如 Redis Pub/Sub、NATS、Kafka 或自研网关层
-- IP 级限流、黑名单和风控，配合当前连接级消息限流
-- Prometheus/Grafana 告警规则和压测基线
+- **JWT 鉴权**：HS256 / RS256 / EdDSA，无状态校验，见上文「鉴权」小节
+- **多租户隔离**：基于 JWT `tenant_id`，主题与私聊均按租户命名空间隔离
+- **IP 级限流**：并发上限 + 新建连接速率双维度，见上文「IP 限流」小节
+- **运维端点**：`/healthz`、`/readyz`、`/metrics`（Prometheus 格式）
+
+生产环境通常还需要在外部接入：
+
+- **TLS 终止**：建议由 Nginx / Envoy / ALB 反代终止 TLS，应用层保持纯 WebSocket。反代示例：
+  ```nginx
+  location /ws {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Real-IP $remote_addr;
+      # 避免把 token 写进 access log
+      proxy_set_header X-Forwarded-Proto $scheme;
+  }
+  ```
+  在反代后请设置 `WS_TRUST_PROXY_HEADERS=true` 以解析真实客户端 IP。
+
+- **多实例广播**：单机核心定位下未内置。需要横向扩展时，可把广播抽象成 trait（默认内存实现，可替换为 Redis Pub/Sub / NATS / Kafka），不必改动协议层。
+- **告警规则与压测基线**：见下文 Grafana 小节，按面板里的趋势线设置阈值告警。
+
+## Grafana
+
+仓库提供 `grafana/dashboard.json`，覆盖连接数、消息吞吐、丢消息、协议错误、鉴权/IP 拒绝等指标。
+
+导入步骤：
+
+1. 在 Grafana 中新建 Prometheus datasource，指向抓取 `/metrics` 的 Prometheus 实例。
+2. `Dashboards → Import → Upload JSON file`，选择 `grafana/dashboard.json`。
+3. 在 datasource 变量中选择上一步创建的 Prometheus。
+4. 默认时间窗口为最近 1 小时，刷新间隔 10s。

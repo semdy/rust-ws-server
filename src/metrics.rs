@@ -9,6 +9,8 @@ pub struct Metrics {
     messages_out: AtomicU64,
     dropped_messages: AtomicU64,
     protocol_errors: AtomicU64,
+    auth_rejected: AtomicU64,
+    ip_rejected: AtomicU64,
 }
 
 impl Metrics {
@@ -41,6 +43,14 @@ impl Metrics {
         self.protocol_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn auth_rejected(&self) {
+        self.auth_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn ip_rejected(&self) {
+        self.ip_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render_prometheus(&self) -> String {
         format!(
             concat!(
@@ -65,6 +75,12 @@ impl Metrics {
                 "# HELP ws_protocol_errors_total Invalid websocket protocol messages.\n",
                 "# TYPE ws_protocol_errors_total counter\n",
                 "ws_protocol_errors_total {}\n",
+                "# HELP ws_auth_rejected_total Connections rejected due to JWT auth failure.\n",
+                "# TYPE ws_auth_rejected_total counter\n",
+                "ws_auth_rejected_total {}\n",
+                "# HELP ws_ip_rejected_total Connections rejected by IP rate limiting.\n",
+                "# TYPE ws_ip_rejected_total counter\n",
+                "ws_ip_rejected_total {}\n",
             ),
             self.active_connections.load(Ordering::Relaxed),
             self.accepted_connections.load(Ordering::Relaxed),
@@ -73,6 +89,8 @@ impl Metrics {
             self.messages_out.load(Ordering::Relaxed),
             self.dropped_messages.load(Ordering::Relaxed),
             self.protocol_errors.load(Ordering::Relaxed),
+            self.auth_rejected.load(Ordering::Relaxed),
+            self.ip_rejected.load(Ordering::Relaxed),
         )
     }
 }

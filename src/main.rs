@@ -1,4 +1,6 @@
+mod auth;
 mod config;
+mod ip_limiter;
 mod metrics;
 mod protocol;
 mod server;

@@ -1,12 +1,15 @@
-use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
     extract::{
-        Query, State,
+        ConnectInfo, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -21,18 +24,23 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
 
 use crate::{
+    auth::AuthIdentity,
+    ip_limiter::{IpPermit, IpRejection},
     protocol::{
         ClientEvent, ServerEvent, encode_server_event, parse_client_event_binary,
         parse_client_event_text,
     },
-    state::{OutboundMessage, SharedState},
+    state::{OutboundMessage, SharedState, tenant_topic},
 };
 
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     #[serde(default = "default_topic")]
     topic: String,
+    /// Ignored when JWT auth is enabled (the `sub` claim overrides it).
     client_id: Option<String>,
+    /// JWT. Required when auth is enabled.
+    token: Option<String>,
 }
 
 fn default_topic() -> String {
@@ -53,9 +61,15 @@ pub fn router(state: SharedState) -> Router {
 pub async fn serve(state: SharedState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(state.config.bind_addr).await?;
     info!(addr = %state.config.bind_addr, "websocket server listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    if state.auth.is_none() {
+        warn!("JWT auth disabled — set WS_JWT_SECRET or WS_JWT_PUBLIC_KEY to require authentication");
+    }
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -75,7 +89,28 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsQuery>,
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
+    let ip = resolve_client_ip(peer, &headers, state.config.trust_proxy_headers);
+
+    // IP-level admission (before the global semaphore so rejected IPs don't consume slots).
+    let ip_permit = match &state.ip_limiter {
+        Some(limiter) => match limiter.try_acquire(ip) {
+            Ok(permit) => Some(permit),
+            Err(reason) => {
+                state.metrics.ip_rejected();
+                state.metrics.connection_rejected();
+                let msg = match reason {
+                    IpRejection::RateLimited => "ip connection rate limit exceeded\n",
+                    IpRejection::ConcurrencyLimited => "ip concurrent connection limit exceeded\n",
+                };
+                return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+            }
+        },
+        None => None,
+    };
+
     let permit = match state.connection_limit.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -88,46 +123,110 @@ async fn ws_handler(
         }
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, query, permit))
+    // JWT auth.
+    let identity = match &state.auth {
+        Some(verifier) => match query.token.as_deref() {
+            Some(token) => match verifier.verify(token) {
+                Ok(identity) => identity,
+                Err(err) => {
+                    state.metrics.auth_rejected();
+                    state.metrics.connection_rejected();
+                    debug!(error = %err, "jwt verification failed");
+                    return (StatusCode::UNAUTHORIZED, "invalid token\n").into_response();
+                }
+            },
+            None => {
+                state.metrics.auth_rejected();
+                state.metrics.connection_rejected();
+                return (StatusCode::UNAUTHORIZED, "missing token\n").into_response();
+            }
+        },
+        None => AuthIdentity {
+            client_id: query
+                .client_id
+                .unwrap_or_else(|| "anonymous".to_owned()),
+            tenant_id: "default".to_owned(),
+        },
+    };
+
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, state, query.topic, identity, permit, ip_permit)
+    })
+}
+
+fn resolve_client_ip(peer: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
+    if trust_proxy {
+        if let Some(xff) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            && let Some(first) = xff.split(',').next()
+            && let Ok(ip) = first.trim().parse::<IpAddr>()
+        {
+            return ip;
+        }
+        if let Some(xrip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+            && let Ok(ip) = xrip.trim().parse::<IpAddr>()
+        {
+            return ip;
+        }
+    }
+    peer.ip()
 }
 
 async fn handle_socket(
     socket: WebSocket,
     state: SharedState,
-    query: WsQuery,
+    raw_topic: String,
+    identity: AuthIdentity,
     _permit: OwnedSemaphorePermit,
+    _ip_permit: Option<IpPermit>,
 ) {
-    let client_id = query.client_id.unwrap_or_else(|| "anonymous".to_owned());
-    let topic = normalize_topic(&query.topic);
+    let client_id = identity.client_id.clone();
+    let tenant_id = identity.tenant_id.clone();
+    let topic = normalize_topic(&raw_topic);
+    let topic_key = tenant_topic(&tenant_id, &topic);
     state.metrics.connection_accepted();
-    info!(%client_id, %topic, "websocket connected");
+    info!(%client_id, %tenant_id, %topic, "websocket connected");
 
-    let result = connection_loop(socket, state.clone(), topic.clone(), client_id.clone()).await;
+    let result = connection_loop(
+        socket,
+        state.clone(),
+        topic_key,
+        tenant_id,
+        client_id.clone(),
+    )
+    .await;
     if let Err(err) = result {
-        warn!(%client_id, %topic, error = %err, "websocket connection ended with error");
+        warn!(%client_id, error = %err, "websocket connection ended with error");
     }
 
     state.metrics.connection_closed();
-    debug!(%client_id, %topic, "websocket closed");
+    debug!(%client_id, "websocket closed");
 }
 
 async fn connection_loop(
     socket: WebSocket,
     state: SharedState,
-    topic: String,
+    topic_key: String,
+    tenant_id: String,
     client_id: String,
 ) -> anyhow::Result<()> {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (client_tx, mut client_rx) =
         mpsc::channel::<OutboundMessage>(state.config.client_queue_capacity);
-    let mut topic_rx = state.subscribe(&topic);
+    let mut topic_rx = state.subscribe(&topic_key);
     let connection_id = state.next_connection_id();
-    state.register_client(client_id.clone(), connection_id, client_tx.clone());
+    state.register_client(
+        client_id.clone(),
+        tenant_id.clone(),
+        connection_id,
+        client_tx.clone(),
+    );
 
     send_encoded(
         &client_tx,
         encode_server_event(&ServerEvent::Ready {
-            topic: &topic,
+            topic: extract_topic(&topic_key),
             client_id: &client_id,
         })?,
         &state,
@@ -183,7 +282,8 @@ async fn connection_loop(
     let idle_timeout = state.config.idle_timeout;
     let reader_state = state.clone();
     let reader_tx = client_tx.clone();
-    let reader_topic = topic.clone();
+    let reader_topic_key = topic_key.clone();
+    let reader_tenant = tenant_id.clone();
     let reader_client_id = client_id.clone();
     let reader = tokio::spawn(async move {
         let mut rate_limiter = RateLimiter::new(
@@ -210,7 +310,7 @@ async fn connection_loop(
                                 send_error(&reader_tx, "message_too_large", "text message exceeds configured limit", &reader_state);
                                 continue;
                             }
-                            handle_text(&reader_state, &reader_tx, &reader_topic, &reader_client_id, &text).await;
+                            handle_text(&reader_state, &reader_tx, &reader_topic_key, &reader_tenant, &reader_client_id, &text).await;
                         }
                         Some(Ok(Message::Binary(raw))) => {
                             reader_state.metrics.message_in();
@@ -223,7 +323,7 @@ async fn connection_loop(
                                 });
                                 break;
                             }
-                            handle_binary(&reader_state, &reader_tx, &reader_topic, &reader_client_id, &raw).await;
+                            handle_binary(&reader_state, &reader_tx, &reader_topic_key, &reader_tenant, &reader_client_id, &raw).await;
                         }
                         Some(Ok(Message::Ping(payload))) => {
                             let _ = reader_tx.try_send(OutboundMessage::Pong(payload));
@@ -276,19 +376,30 @@ async fn connection_loop(
         }
     }
 
-    state.unregister_client(&client_id, connection_id);
+    state.unregister_client(&client_id, &tenant_id, connection_id);
     result
 }
 
 async fn handle_text(
     state: &SharedState,
     client_tx: &mpsc::Sender<OutboundMessage>,
-    default_topic: &str,
+    default_topic_key: &str,
+    tenant_id: &str,
     client_id: &str,
     text: &str,
 ) {
     match parse_client_event_text(text) {
-        Ok(event) => handle_client_event(state, client_tx, default_topic, client_id, event).await,
+        Ok(event) => {
+            handle_client_event(
+                state,
+                client_tx,
+                default_topic_key,
+                tenant_id,
+                client_id,
+                event,
+            )
+            .await
+        }
         Err(_) => {
             state.metrics.protocol_error();
             send_error(
@@ -304,12 +415,23 @@ async fn handle_text(
 async fn handle_binary(
     state: &SharedState,
     client_tx: &mpsc::Sender<OutboundMessage>,
-    default_topic: &str,
+    default_topic_key: &str,
+    tenant_id: &str,
     client_id: &str,
     raw: &[u8],
 ) {
     match parse_client_event_binary(raw) {
-        Ok(event) => handle_client_event(state, client_tx, default_topic, client_id, event).await,
+        Ok(event) => {
+            handle_client_event(
+                state,
+                client_tx,
+                default_topic_key,
+                tenant_id,
+                client_id,
+                event,
+            )
+            .await
+        }
         Err(_) => {
             state.metrics.protocol_error();
             send_error(
@@ -325,7 +447,8 @@ async fn handle_binary(
 async fn handle_client_event(
     state: &SharedState,
     client_tx: &mpsc::Sender<OutboundMessage>,
-    default_topic: &str,
+    default_topic_key: &str,
+    tenant_id: &str,
     client_id: &str,
     event: ClientEvent,
 ) {
@@ -335,18 +458,18 @@ async fn handle_client_event(
             request_id,
             payload,
         } => {
-            let topic = topic
+            let topic_key = topic
                 .as_deref()
-                .map(normalize_topic)
-                .unwrap_or_else(|| default_topic.to_owned());
+                .map(|t| tenant_topic(tenant_id, &normalize_topic(t)))
+                .unwrap_or_else(|| default_topic_key.to_owned());
             match encode_server_event(&ServerEvent::Message {
-                topic: &topic,
+                topic: extract_topic(&topic_key),
                 from: client_id,
                 request_id: request_id.as_deref(),
                 payload: &payload,
             }) {
                 Ok(encoded) => {
-                    let receivers = state.publish(&topic, encoded);
+                    let receivers = state.publish(&topic_key, encoded);
                     if receivers == 0 {
                         state.metrics.message_dropped();
                     }
@@ -373,7 +496,7 @@ async fn handle_client_event(
             payload: &payload,
         }) {
             Ok(encoded) => {
-                if !state.send_to_client(&to, encoded) {
+                if !state.send_to_client(&to, tenant_id, encoded) {
                     state.metrics.message_dropped();
                     send_error(
                         client_tx,
@@ -448,6 +571,12 @@ fn task_result(
         Err(err) if err.is_cancelled() => Ok(()),
         Err(err) => Err(anyhow::anyhow!("{task_name} task failed: {err}")),
     }
+}
+
+/// Extract the client-facing topic name from an internal `tenant:topic` key.
+/// Falls back to the whole string if no `:` is present (defensive).
+fn extract_topic(topic_key: &str) -> &str {
+    topic_key.split_once(':').map(|(_, t)| t).unwrap_or(topic_key)
 }
 
 #[derive(Clone, Copy, Debug)]

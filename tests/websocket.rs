@@ -1,15 +1,54 @@
 use std::{net::SocketAddr, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rust_ws_server::{config::Config, server, state::AppState};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-async fn spawn_server(max_connections: usize) -> (SocketAddr, JoinHandle<()>) {
-    spawn_server_with_config(Config {
-        bind_addr: free_addr().await,
-        max_connections,
+const TEST_SECRET: &str = "test-secret";
+
+#[derive(Serialize, Deserialize)]
+struct TestClaims {
+    sub: String,
+    tenant_id: Option<String>,
+    exp: i64,
+    iss: Option<String>,
+}
+
+fn now_plus(secs: i64) -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + secs
+}
+
+fn sign_token(claims: &TestClaims) -> String {
+    encode(
+        &Header::new(Algorithm::HS256),
+        claims,
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn token_for(sub: &str, tenant_id: Option<&str>) -> String {
+    sign_token(&TestClaims {
+        sub: sub.to_owned(),
+        tenant_id: tenant_id.map(str::to_owned),
+        exp: now_plus(3600),
+        iss: None,
+    })
+}
+
+fn base_config() -> Config {
+    Config {
+        bind_addr: "0.0.0.0:0".parse::<SocketAddr>().unwrap(),
+        max_connections: 10,
         client_queue_capacity: 16,
         topic_channel_capacity: 32,
         max_text_bytes: 64 * 1024,
@@ -18,8 +57,14 @@ async fn spawn_server(max_connections: usize) -> (SocketAddr, JoinHandle<()>) {
         idle_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(60),
         json_logs: false,
-    })
-    .await
+        jwt_secret: None,
+        jwt_public_key: None,
+        jwt_issuer: None,
+        ip_max_concurrent: None,
+        ip_connection_rate: None,
+        ip_rate_burst: None,
+        trust_proxy_headers: false,
+    }
 }
 
 async fn free_addr() -> SocketAddr {
@@ -29,15 +74,33 @@ async fn free_addr() -> SocketAddr {
     addr
 }
 
-async fn spawn_server_with_config(config: Config) -> (SocketAddr, JoinHandle<()>) {
+async fn spawn_server(config: Config) -> (SocketAddr, JoinHandle<()>) {
     let addr = config.bind_addr;
     let state = AppState::new(config);
     let app = server::router(state);
     let listener = TcpListener::bind(addr).await.unwrap();
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     (addr, handle)
+}
+
+async fn spawn_default_server() -> (SocketAddr, JoinHandle<()>) {
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    spawn_server(config).await
+}
+
+async fn spawn_auth_server() -> (SocketAddr, JoinHandle<()>) {
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    config.jwt_secret = Some(TEST_SECRET.into());
+    spawn_server(config).await
 }
 
 fn text_message(value: serde_json::Value) -> Message {
@@ -66,9 +129,10 @@ where
 
 #[tokio::test]
 async fn broadcasts_messages_to_topic_subscribers() {
-    let (addr, handle) = spawn_server(10).await;
-    let url = format!("ws://{addr}/ws?topic=test&client_id=a");
-    let (mut a, _) = connect_async(&url).await.unwrap();
+    let (addr, handle) = spawn_default_server().await;
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
+        .await
+        .unwrap();
     let (mut b, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=b"))
         .await
         .unwrap();
@@ -91,7 +155,7 @@ async fn broadcasts_messages_to_topic_subscribers() {
 
 #[tokio::test]
 async fn sends_direct_messages_to_one_client() {
-    let (addr, handle) = spawn_server(10).await;
+    let (addr, handle) = spawn_default_server().await;
     let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
         .await
         .unwrap();
@@ -126,19 +190,11 @@ async fn sends_direct_messages_to_one_client() {
 
 #[tokio::test]
 async fn rate_limits_noisy_clients() {
-    let (addr, handle) = spawn_server_with_config(Config {
-        bind_addr: free_addr().await,
-        max_connections: 10,
-        client_queue_capacity: 16,
-        topic_channel_capacity: 32,
-        max_text_bytes: 64 * 1024,
-        max_messages_per_second: 1,
-        message_burst: 1,
-        idle_timeout: Duration::from_secs(5),
-        heartbeat_interval: Duration::from_secs(60),
-        json_logs: false,
-    })
-    .await;
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    config.max_messages_per_second = 1;
+    config.message_burst = 1;
+    let (addr, handle) = spawn_server(config).await;
 
     let (mut client, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=noisy"))
         .await
@@ -179,7 +235,11 @@ async fn rate_limits_noisy_clients() {
 
 #[tokio::test]
 async fn rejects_connections_over_limit() {
-    let (addr, handle) = spawn_server(1).await;
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    config.max_connections = 1;
+    let (addr, handle) = spawn_server(config).await;
+
     let (mut first, _) = connect_async(format!("ws://{addr}/ws?topic=limit"))
         .await
         .unwrap();
@@ -193,7 +253,7 @@ async fn rejects_connections_over_limit() {
 
 #[tokio::test]
 async fn accepts_msgpack_client_messages() {
-    let (addr, handle) = spawn_server(10).await;
+    let (addr, handle) = spawn_default_server().await;
     let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
         .await
         .unwrap();
@@ -214,5 +274,119 @@ async fn accepts_msgpack_client_messages() {
     assert_eq!(received["kind"], "message");
     assert_eq!(received["payload"]["text"], "hello msgpack");
 
+    handle.abort();
+}
+
+#[tokio::test]
+async fn rejects_connection_without_token_when_auth_enabled() {
+    let (addr, handle) = spawn_auth_server().await;
+    let result = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a")).await;
+    assert!(result.is_err());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn accepts_connection_with_valid_jwt() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token = token_for("alice", None);
+    let url = format!("ws://{addr}/ws?topic=test&token={token}");
+    let (mut a, _) = connect_async(&url).await.unwrap();
+    let ready = next_server_event(&mut a).await;
+    // The `sub` claim overrides any client_id; ready echoes the JWT-derived identity.
+    assert_eq!(ready["kind"], "ready");
+    assert_eq!(ready["client_id"], "alice");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn isolates_topics_between_tenants() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token_a = token_for("alice", Some("t1"));
+    let token_b = token_for("bob", Some("t2"));
+    // Both connect to the same client-facing topic name "room-a".
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=room-a&token={token_a}"))
+        .await
+        .unwrap();
+    let (mut b, _) = connect_async(format!("ws://{addr}/ws?topic=room-a&token={token_b}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
+
+    a.send(text_message(
+        json!({"kind":"publish","request_id":"r1","payload":{"text":"only t1 sees this"}}),
+    ))
+    .await
+    .unwrap();
+
+    // Bob (t2) should NOT receive the message — different tenant.
+    let not_received = tokio::time::timeout(Duration::from_millis(200), b.next()).await;
+    assert!(not_received.is_err());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn blocks_direct_messages_across_tenants() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token_a = token_for("alice", Some("t1"));
+    let token_b = token_for("bob", Some("t2"));
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&token={token_a}"))
+        .await
+        .unwrap();
+    let (mut b, _) = connect_async(format!("ws://{addr}/ws?topic=test&token={token_b}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
+
+    // Alice (t1) tries to direct-message bob (t2). Cross-tenant must be blocked.
+    a.send(text_message(
+        json!({"kind":"direct","to":"bob","request_id":"d1","payload":{"text":"cross-tenant"}}),
+    ))
+    .await
+    .unwrap();
+
+    // Alice should get a client_not_found error.
+    let err = next_server_event(&mut a).await;
+    assert_eq!(err["code"], "client_not_found");
+    // Bob should not receive anything.
+    let not_received = tokio::time::timeout(Duration::from_millis(200), b.next()).await;
+    assert!(not_received.is_err());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn rejects_connection_over_ip_concurrent_limit() {
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    config.ip_max_concurrent = Some(1);
+    let (addr, handle) = spawn_server(config).await;
+
+    let (mut first, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut first).await;
+
+    let second = connect_async(format!("ws://{addr}/ws?topic=test&client_id=b")).await;
+    assert!(second.is_err());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn rejects_connection_over_ip_rate_limit() {
+    let mut config = base_config();
+    config.bind_addr = free_addr().await;
+    config.ip_connection_rate = Some(1);
+    config.ip_rate_burst = Some(1);
+    let (addr, handle) = spawn_server(config).await;
+
+    // First connection consumes the single token.
+    let (_first, _) = connect_async(format!("ws://{addr}/ws?topic=test&client_id=a"))
+        .await
+        .unwrap();
+
+    // Immediate second connection from the same IP must be rejected.
+    let second = connect_async(format!("ws://{addr}/ws?topic=test&client_id=b")).await;
+    assert!(second.is_err());
     handle.abort();
 }
