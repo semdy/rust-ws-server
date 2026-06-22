@@ -190,6 +190,9 @@ mod tests {
             ip_connection_rate: None,
             ip_rate_burst: None,
             trust_proxy_headers: false,
+            tenant_max_connections: None,
+            tenant_max_messages_per_second: None,
+            tenant_message_burst: None,
         }
     }
 

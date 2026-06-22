@@ -11,6 +11,8 @@ pub struct Metrics {
     protocol_errors: AtomicU64,
     auth_rejected: AtomicU64,
     ip_rejected: AtomicU64,
+    tenant_rejected: AtomicU64,
+    tenant_rate_rejected: AtomicU64,
 }
 
 impl Metrics {
@@ -51,6 +53,14 @@ impl Metrics {
         self.ip_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn tenant_rejected(&self) {
+        self.tenant_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn tenant_rate_rejected(&self) {
+        self.tenant_rate_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render_prometheus(&self) -> String {
         format!(
             concat!(
@@ -81,6 +91,12 @@ impl Metrics {
                 "# HELP ws_ip_rejected_total Connections rejected by IP rate limiting.\n",
                 "# TYPE ws_ip_rejected_total counter\n",
                 "ws_ip_rejected_total {}\n",
+                "# HELP ws_tenant_rejected_total Connections rejected by per-tenant connection cap.\n",
+                "# TYPE ws_tenant_rejected_total counter\n",
+                "ws_tenant_rejected_total {}\n",
+                "# HELP ws_tenant_rate_rejected_total Inbound messages dropped by per-tenant rate limit.\n",
+                "# TYPE ws_tenant_rate_rejected_total counter\n",
+                "ws_tenant_rate_rejected_total {}\n",
             ),
             self.active_connections.load(Ordering::Relaxed),
             self.accepted_connections.load(Ordering::Relaxed),
@@ -91,6 +107,8 @@ impl Metrics {
             self.protocol_errors.load(Ordering::Relaxed),
             self.auth_rejected.load(Ordering::Relaxed),
             self.ip_rejected.load(Ordering::Relaxed),
+            self.tenant_rejected.load(Ordering::Relaxed),
+            self.tenant_rate_rejected.load(Ordering::Relaxed),
         )
     }
 }

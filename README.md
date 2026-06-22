@@ -46,6 +46,9 @@ WS_IP_MAX_CONCURRENT=200 \
 WS_IP_CONNECTION_RATE=20 \
 WS_IP_RATE_BURST=40 \
 WS_TRUST_PROXY_HEADERS=true \
+WS_TENANT_MAX_CONNECTIONS=500 \
+WS_TENANT_MAX_MESSAGES_PER_SECOND=200 \
+WS_TENANT_MESSAGE_BURST=400 \
 cargo run --release
 ```
 
@@ -70,6 +73,8 @@ JWT 中携带 `tenant_id` 时自动启用租户隔离：
 - 同名主题在不同租户间互不可见（`t1:room-a` 与 `t2:room-a` 物理隔离）
 - `direct` 私聊限定同租户，跨租户发送按 `client_not_found` 处理（不泄露目标存在性）
 - 同一 `client_id` 可在不同租户中并存
+- 配置 `WS_TENANT_MAX_CONNECTIONS` 后，每个租户有独立的并发连接上限，防止某个吵闹租户打满全局连接池饿死其他租户；不同租户的配额互不影响
+- 配置 `WS_TENANT_MAX_MESSAGES_PER_SECOND` / `WS_TENANT_MESSAGE_BURST` 后，每个租户的入站消息聚合计数令牌桶，超限消息被丢弃并返回 `tenant_rate_limited` error（**不关闭连接**，因为单连接不应为租户级聚合行为背锅）；不同租户的桶独立
 
 ### IP 限流
 

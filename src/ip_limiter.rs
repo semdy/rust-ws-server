@@ -19,7 +19,7 @@ struct IpState {
 }
 
 #[derive(Debug)]
-struct TokenBucket {
+pub(crate) struct TokenBucket {
     capacity: f64,
     tokens: f64,
     refill_per_second: f64,
@@ -27,7 +27,7 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(refill_per_second: f64, burst: f64) -> Self {
+    pub(crate) fn new(refill_per_second: f64, burst: f64) -> Self {
         let capacity = burst.max(1.0);
         Self {
             capacity,
@@ -37,7 +37,7 @@ impl TokenBucket {
         }
     }
 
-    fn try_consume(&mut self) -> bool {
+    pub(crate) fn try_consume(&mut self) -> bool {
         self.refill();
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -212,6 +212,9 @@ mod tests {
             ip_connection_rate: rate,
             ip_rate_burst: burst,
             trust_proxy_headers: false,
+            tenant_max_connections: None,
+            tenant_max_messages_per_second: None,
+            tenant_message_burst: None,
         }
     }
 

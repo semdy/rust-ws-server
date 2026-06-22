@@ -62,4 +62,19 @@ pub struct Config {
     /// Trust X-Forwarded-For / X-Real-IP headers for client IP. Only enable behind a trusted reverse proxy.
     #[arg(long, env = "WS_TRUST_PROXY_HEADERS", default_value_t = false)]
     pub trust_proxy_headers: bool,
+
+    /// Max concurrent websocket connections per tenant (identified by JWT `tenant_id`).
+    /// None = unlimited. Prevents one noisy tenant from starving others on a shared instance.
+    #[arg(long, env = "WS_TENANT_MAX_CONNECTIONS")]
+    pub tenant_max_connections: Option<usize>,
+
+    /// Per-tenant inbound message rate (messages per second, aggregated across all of the
+    /// tenant's connections). None = unlimited. Caps a noisy tenant's publish/direct volume
+    /// so it cannot saturate the broadcast queues of other tenants' topics.
+    #[arg(long, env = "WS_TENANT_MAX_MESSAGES_PER_SECOND")]
+    pub tenant_max_messages_per_second: Option<u32>,
+
+    /// Burst size for the per-tenant message rate limiter. Defaults to the rate when unset.
+    #[arg(long, env = "WS_TENANT_MESSAGE_BURST")]
+    pub tenant_message_burst: Option<u32>,
 }

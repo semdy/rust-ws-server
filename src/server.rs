@@ -149,9 +149,31 @@ async fn ws_handler(
         },
     };
 
-    ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, query.topic, identity, permit, ip_permit)
-    })
+    // Per-tenant concurrent-connection cap. Applied after auth so we know the tenant_id.
+    // Rejected tenants don't hold the global connection slot — `permit` is dropped on return.
+    let tenant_permit = match state.acquire_tenant_permit(&identity.tenant_id) {
+        None => None,
+        Some(Ok(p)) => Some(p),
+        Some(Err(())) => {
+            state.metrics.tenant_rejected();
+            state.metrics.connection_rejected();
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "tenant connection limit exceeded\n",
+            )
+                .into_response();
+        }
+    };
+
+    ws.on_upgrade(move |socket| handle_socket(
+        socket,
+        state,
+        query.topic,
+        identity,
+        permit,
+        ip_permit,
+        tenant_permit,
+    ))
 }
 
 fn resolve_client_ip(peer: SocketAddr, headers: &HeaderMap, trust_proxy: bool) -> IpAddr {
@@ -180,6 +202,7 @@ async fn handle_socket(
     identity: AuthIdentity,
     _permit: OwnedSemaphorePermit,
     _ip_permit: Option<IpPermit>,
+    _tenant_permit: Option<OwnedSemaphorePermit>,
 ) {
     let client_id = identity.client_id.clone();
     let tenant_id = identity.tenant_id.clone();
@@ -310,6 +333,11 @@ async fn connection_loop(
                                 send_error(&reader_tx, "message_too_large", "text message exceeds configured limit", &reader_state);
                                 continue;
                             }
+                            if !reader_state.check_tenant_rate(&reader_tenant) {
+                                reader_state.metrics.tenant_rate_rejected();
+                                send_error(&reader_tx, "tenant_rate_limited", "tenant message rate exceeded", &reader_state);
+                                continue;
+                            }
                             handle_text(&reader_state, &reader_tx, &reader_topic_key, &reader_tenant, &reader_client_id, &text).await;
                         }
                         Some(Ok(Message::Binary(raw))) => {
@@ -322,6 +350,11 @@ async fn connection_loop(
                                     reason: "rate limit exceeded",
                                 });
                                 break;
+                            }
+                            if !reader_state.check_tenant_rate(&reader_tenant) {
+                                reader_state.metrics.tenant_rate_rejected();
+                                send_error(&reader_tx, "tenant_rate_limited", "tenant message rate exceeded", &reader_state);
+                                continue;
                             }
                             handle_binary(&reader_state, &reader_tx, &reader_topic_key, &reader_tenant, &reader_client_id, &raw).await;
                         }

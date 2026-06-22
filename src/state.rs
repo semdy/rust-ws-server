@@ -11,7 +11,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc};
 use crate::{
     auth::AuthVerifier,
     config::Config,
-    ip_limiter::IpLimiter,
+    ip_limiter::{IpLimiter, TokenBucket},
     metrics::Metrics,
 };
 
@@ -24,6 +24,14 @@ pub struct AppState {
     pub connection_limit: Arc<Semaphore>,
     pub auth: Option<AuthVerifier>,
     pub ip_limiter: Option<Arc<IpLimiter>>,
+    /// Per-tenant concurrent-connection cap. `None` when `WS_TENANT_MAX_CONNECTIONS` is unset.
+    /// Each tenant gets its own `Semaphore`; a noisy tenant exhausting its own slot cannot
+    /// starve other tenants.
+    pub tenant_limits: Option<DashMap<String, Arc<Semaphore>>>,
+    /// Per-tenant inbound message-rate bucket. `None` when
+    /// `WS_TENANT_MAX_MESSAGES_PER_SECOND` is unset. Aggregated across all of a tenant's
+    /// connections so a tenant sharding its load over many sockets still hits a single cap.
+    tenant_rate_limits: Option<DashMap<String, parking_lot::Mutex<TokenBucket>>>,
     topics: DashMap<String, broadcast::Sender<Bytes>>,
     // Keyed by (tenant_id, client_id) so the same client_id can exist in different tenants.
     clients: DashMap<(String, String), ClientHandle>,
@@ -60,10 +68,18 @@ impl AppState {
     pub fn new(config: Config) -> SharedState {
         let auth = AuthVerifier::from_config(&config);
         let ip_limiter = IpLimiter::from_config(&config);
+        let tenant_limits = config
+            .tenant_max_connections
+            .map(|_| DashMap::<String, Arc<Semaphore>>::new());
+        let tenant_rate_limits = config.tenant_max_messages_per_second.map(|_| {
+            DashMap::<String, parking_lot::Mutex<TokenBucket>>::new()
+        });
         Arc::new(Self {
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
             auth,
             ip_limiter,
+            tenant_limits,
+            tenant_rate_limits,
             config,
             metrics: Metrics::default(),
             topics: DashMap::new(),
@@ -74,6 +90,60 @@ impl AppState {
 
     pub fn next_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Try to acquire a per-tenant connection permit. Returns `Ok(permit)` when admitted,
+    /// `Err(())` when the tenant's cap is reached, or `Ok(None)`-style via `Option` when
+    /// tenant limits are not configured.
+    ///
+    /// Actually returns `Option<Result<OwnedSemaphorePermit, ()>>`:
+    /// - `None` — tenant limits not configured, admit freely
+    /// - `Some(Ok(permit))` — admitted, permit releases on drop
+    /// - `Some(Err(()))` — tenant cap reached
+    pub fn acquire_tenant_permit(
+        &self,
+        tenant_id: &str,
+    ) -> Option<Result<tokio::sync::OwnedSemaphorePermit, ()>> {
+        let limits = self.tenant_limits.as_ref()?;
+        let cap = self.config.tenant_max_connections?;
+        // Clone the Arc<Semaphore> out of the map so we don't hold a DashMap guard across await
+        // (try_acquire_owned is sync, but this keeps the pattern future-proof).
+        let sem = limits
+            .entry(tenant_id.to_owned())
+            .or_insert_with(|| Arc::new(Semaphore::new(cap)))
+            .clone();
+        match sem.clone().try_acquire_owned() {
+            Ok(permit) => Some(Ok(permit)),
+            Err(_) => Some(Err(())),
+        }
+    }
+
+    /// Check the per-tenant inbound message-rate bucket. Returns `true` when the message is
+    /// admitted, `false` when the tenant's aggregate rate is exceeded. Returns `true`
+    /// unconditionally when per-tenant rate limiting is not configured.
+    ///
+    /// Unlike the per-connection rate limiter (which closes the socket on violation), a
+    /// tenant-level rejection only drops the offending message — the connection stays open,
+    /// since a single client shouldn't be punished for aggregate tenant behavior it may not
+    /// control alone.
+    pub fn check_tenant_rate(&self, tenant_id: &str) -> bool {
+        let limits = match self.tenant_rate_limits.as_ref() {
+            Some(l) => l,
+            None => return true,
+        };
+        let rate = match self.config.tenant_max_messages_per_second {
+            Some(r) => r as f64,
+            None => return true,
+        };
+        let burst = self
+            .config
+            .tenant_message_burst
+            .map(|b| b as f64)
+            .unwrap_or(rate.max(1.0));
+        let entry = limits
+            .entry(tenant_id.to_owned())
+            .or_insert_with(|| parking_lot::Mutex::new(TokenBucket::new(rate, burst)));
+        entry.lock().try_consume()
     }
 
     pub fn register_client(
@@ -163,6 +233,9 @@ mod tests {
             ip_connection_rate: None,
             ip_rate_burst: None,
             trust_proxy_headers: false,
+            tenant_max_connections: None,
+            tenant_max_messages_per_second: None,
+            tenant_message_burst: None,
         }
     }
 
