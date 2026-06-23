@@ -289,6 +289,45 @@ async fn rejects_connection_without_token_when_auth_enabled() {
 }
 
 #[tokio::test]
+async fn url_tenant_id_isolates_topics_in_dev_mode() {
+    // JWT disabled — `?tenant_id=` on the URL is the source of tenant identity.
+    let (addr, handle) = spawn_default_server().await;
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=room&client_id=a&tenant_id=t1"))
+        .await
+        .unwrap();
+    let (mut b, _) = connect_async(format!("ws://{addr}/ws?topic=room&client_id=b&tenant_id=t2"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut a).await;
+    let _ = next_server_event(&mut b).await;
+
+    a.send(text_message(
+        json!({"kind":"publish","request_id":"r1","payload":{"text":"t1 only"}}),
+    ))
+    .await
+    .unwrap();
+
+    // Same topic name, different tenant — b must not see a's message.
+    let not_received = tokio::time::timeout(Duration::from_millis(200), b.next()).await;
+    assert!(not_received.is_err());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn jwt_ignores_url_tenant_id() {
+    // JWT enabled — the claim's tenant_id wins; URL `?tenant_id=` is silently ignored.
+    let (addr, handle) = spawn_auth_server().await;
+    let token = token_for("alice", Some("t1"));
+    // URL claims tenant_id=t2, but JWT says t1. Identity must be t1.
+    let (mut a, _) = connect_async(format!("ws://{addr}/ws?topic=test&token={token}&tenant_id=t2"))
+        .await
+        .unwrap();
+    let ready = next_server_event(&mut a).await;
+    assert_eq!(ready["client_id"], "alice");
+    handle.abort();
+}
+
+#[tokio::test]
 async fn accepts_connection_with_valid_jwt() {
     let (addr, handle) = spawn_auth_server().await;
     let token = token_for("alice", None);

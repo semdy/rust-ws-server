@@ -39,6 +39,9 @@ struct WsQuery {
     topic: String,
     /// Ignored when JWT auth is enabled (the `sub` claim overrides it).
     client_id: Option<String>,
+    /// Only honored when JWT auth is disabled. Ignored silently when JWT is enabled
+    /// (the `tenant_id` claim is authoritative in that case).
+    tenant_id: Option<String>,
     /// JWT. Required when auth is enabled.
     token: Option<String>,
 }
@@ -127,7 +130,16 @@ async fn ws_handler(
     let identity = match &state.auth {
         Some(verifier) => match query.token.as_deref() {
             Some(token) => match verifier.verify(token) {
-                Ok(identity) => identity,
+                Ok(identity) => {
+                    if query.tenant_id.is_some() {
+                        debug!(
+                            query_tenant_id = ?query.tenant_id,
+                            jwt_tenant_id = %identity.tenant_id,
+                            "ignoring ?tenant_id query param — JWT claim is authoritative",
+                        );
+                    }
+                    identity
+                }
                 Err(err) => {
                     state.metrics.auth_rejected();
                     state.metrics.connection_rejected();
@@ -145,7 +157,9 @@ async fn ws_handler(
             client_id: query
                 .client_id
                 .unwrap_or_else(|| "anonymous".to_owned()),
-            tenant_id: "default".to_owned(),
+            tenant_id: query
+                .tenant_id
+                .unwrap_or_else(|| "default".to_owned()),
         },
     };
 

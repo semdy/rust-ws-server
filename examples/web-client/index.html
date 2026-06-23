@@ -185,6 +185,10 @@
             <input id="clientId" value="web-demo" />
           </label>
           <label>
+            Tenant ID
+            <input id="tenantId" value="default" />
+          </label>
+          <label>
             状态
             <span class="status">
               <span id="statusDot" class="dot"></span>
@@ -235,6 +239,7 @@
         server: document.querySelector("#server"),
         topic: document.querySelector("#topic"),
         clientId: document.querySelector("#clientId"),
+        tenantId: document.querySelector("#tenantId"),
         statusDot: document.querySelector("#statusDot"),
         statusText: document.querySelector("#statusText"),
         connectBtn: document.querySelector("#connectBtn"),
@@ -274,6 +279,7 @@
         const url = new URL(els.server.value);
         url.searchParams.set("topic", els.topic.value || "public");
         url.searchParams.set("client_id", els.clientId.value || "web-demo");
+        url.searchParams.set("tenant_id", els.tenantId.value || "default");
         return url.toString();
       }
 

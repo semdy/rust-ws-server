@@ -135,7 +135,14 @@ jwt encode --secret "your-hmac-secret" --alg HS256 \
 
 ### 多租户
 
-JWT 中携带 `tenant_id` 时自动启用租户隔离：
+`tenant_id` 的来源取决于鉴权模式：
+
+| 模式 | tenant_id 来源 | 说明 |
+|------|----------------|------|
+| JWT 启用 | JWT 的 `tenant_id` claim | URL 里的 `?tenant_id=` 被静默忽略（JWT claim 是权威来源） |
+| JWT 关闭 | URL 的 `?tenant_id=`，缺省 `default` | 便于本地开发/测试多租户语义；生产环境必须开 JWT |
+
+无论哪种来源，启用后即生效：
 
 - 同名主题在不同租户间互不可见（`t1:room-a` 与 `t2:room-a` 物理隔离）
 - `direct` 私聊限定同租户，跨租户发送按 `client_not_found` 处理（不泄露目标存在性）
