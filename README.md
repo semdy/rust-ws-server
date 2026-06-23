@@ -176,6 +176,32 @@ ws://127.0.0.1:8080/ws?topic=public&token=eyJhbGciOiJIUzI1NiIs...
 
 服务端出站统一返回 MessagePack 二进制 frame。Web 示例页面已经内置当前协议所需的轻量 MessagePack 解码器。
 
+#### MessagePack 入站示例
+
+浏览器（配合 `msgpackr`、`@msgpack/msgpack`、`msgpack-lite` 等库）：
+
+```js
+const bytes = msgpackEncode({
+  kind: "publish",
+  request_id: "r1",
+  payload: { text: "hello msgpack" }
+});
+socket.send(new Uint8Array(bytes));   // 发送 binary frame
+```
+
+Rust 客户端：
+
+```rust
+let bytes = rmp_serde::to_vec_named(&serde_json::json!({
+    "kind": "publish",
+    "request_id": "r1",
+    "payload": { "text": "hello msgpack" }
+}))?;
+ws.send(Message::Binary(bytes.into())).await?;
+```
+
+两种入站格式可混用，服务端按 frame 类型分派解析。
+
 发布消息到当前主题：
 
 ```json
