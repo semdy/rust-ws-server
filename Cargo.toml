@@ -9,6 +9,7 @@ axum = { version = "0.7", features = ["ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
+dotenvy = "0.15"
 futures-util = "0.3"
 humantime = "2"
 humantime-serde = "1"

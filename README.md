@@ -52,6 +52,23 @@ WS_TENANT_MESSAGE_BURST=400 \
 cargo run --release
 ```
 
+### `.env` 自动加载
+
+启动时（`Config::parse` 之前）会尝试加载项目根目录的 `.env` 文件，存在则自动注入环境变量，不存在则跳过。便于本地开发，生产环境仍走真实环境变量。
+
+```bash
+# .env （已 gitignore，不会入库）
+WS_JWT_SECRET=your-hmac-secret
+WS_TENANT_MAX_CONNECTIONS=500
+WS_TENANT_MAX_MESSAGES_PER_SECOND=200
+```
+
+```bash
+cargo run --release   # 自动读取上面的 .env
+```
+
+也可继续用命令行前缀或 `export` 覆盖，优先级与 std::env 一致。
+
 ### 鉴权（JWT）
 
 配置 `WS_JWT_SECRET`（HS256）或 `WS_JWT_PUBLIC_KEY`（RS256/EdDSA PEM）即启用 JWT 鉴权。
@@ -65,6 +82,56 @@ cargo run --release
 | `tenant_id` | 否 | 租户 ID。缺失时归入 `default` 租户 |
 | `exp` | 是 | 过期时间，强制校验 |
 | `iss` | 否 | 可选签发方；配置 `WS_JWT_ISSUER` 后才校验 |
+
+#### Token 生成
+
+**方式一：`mint-token` 示例（推荐，与项目同一套库）**
+
+仓库提供 `examples/mint-token.rs`，读 `WS_JWT_SECRET` 签发 HS256 token：
+
+```bash
+WS_JWT_SECRET=your-hmac-secret \
+CLIENT_ID=alice \
+TENANT_ID=t1 \
+TTL_SECS=3600 \
+cargo run --example mint-token
+```
+
+输出即为 token，拼到 URL 里：
+
+```text
+ws://127.0.0.1:8080/ws?topic=public&token=eyJhbGciOiJIUzI1NiIs...
+```
+
+环境变量说明：
+
+| 变量 | 必需 | 说明 |
+|------|------|------|
+| `WS_JWT_SECRET` | 是 | HMAC 密钥，必须与服务端一致 |
+| `CLIENT_ID` | 否 | `sub` 字段，缺省 `alice` |
+| `TENANT_ID` | 否 | `tenant_id` 字段，缺省归入 `default` |
+| `TTL_SECS` | 否 | 有效期秒数，缺省 3600 |
+| `ISS` | 否 | `iss` 字段，仅服务端配了 `WS_JWT_ISSUER` 时需要 |
+
+**方式二：`jwt-cli` 命令行（不开 Rust）**
+
+```bash
+# 安装：cargo install jwt-cli
+jwt encode --secret "your-hmac-secret" --alg HS256 \
+  --exp "$(date -v+1H +%s)" \
+  '{"sub":"alice","tenant_id":"t1"}'
+```
+
+关键字段
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `sub` | 是 | 成为 `client_id` |
+| `tenant_id` | 否 | 缺省归 `default` |
+| `exp` | 是 | Unix 秒，过期失效 |
+| `iss` | 否 | 配了 `WS_JWT_ISSUER` 才校验 |
+
+两种方式产出的 token 等价，服务端只校验签名和 `exp`。
 
 ### 多租户
 

@@ -13,6 +13,9 @@ use crate::{config::Config, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load `.env` if present. Missing file is fine — production runs without it.
+    // Must happen before `Config::parse()` so clap's env-var bindings see the values.
+    let _ = dotenvy::dotenv();
     let config = Config::parse();
     init_tracing(config.json_logs);
     server::serve(AppState::new(config)).await
