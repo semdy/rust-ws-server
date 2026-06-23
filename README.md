@@ -181,12 +181,14 @@ ws://127.0.0.1:8080/ws?topic=public&token=eyJhbGciOiJIUzI1NiIs...
 浏览器（配合 `msgpackr`、`@msgpack/msgpack`、`msgpack-lite` 等库）：
 
 ```js
-const bytes = msgpackEncode({
+import { pack, unpack } from 'msgpackr';
+const buf = pack({
   kind: "publish",
   request_id: "r1",
   payload: { text: "hello msgpack" }
 });
-socket.send(new Uint8Array(bytes));   // 发送 binary frame
+// const obj = unpack(buf);
+socket.send(new Uint8Array(buf));   // 发送 binary frame
 ```
 
 Rust 客户端：
