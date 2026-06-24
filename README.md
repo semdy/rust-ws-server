@@ -204,7 +204,7 @@ const buf = pack({
 socket.send(new Uint8Array(buf));   // 发送 binary frame
 ```
 
-Rust 客户端：
+Rust 客户端发送 MessagePack binary frame 的形态：
 
 ```rust
 let bytes = rmp_serde::to_vec_named(&serde_json::json!({
@@ -252,15 +252,6 @@ ws.send(Message::Binary(bytes.into())).await?;
 ```
 
 Rust 客户端发送 MessagePack binary frame 的形态：
-
-```rust
-let bytes = rmp_serde::to_vec_named(&serde_json::json!({
-    "kind": "publish",
-    "request_id": "r1",
-    "payload": { "text": "hello msgpack" }
-}))?;
-ws.send(Message::Binary(bytes.into())).await?;
-```
 
 ## Web 客户端示例
 
