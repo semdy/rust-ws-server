@@ -189,6 +189,10 @@
             <input id="tenantId" value="default" />
           </label>
           <label>
+            Token
+            <input id="token" value="" />
+          </label>
+          <label>
             状态
             <span class="status">
               <span id="statusDot" class="dot"></span>
@@ -240,6 +244,7 @@
         topic: document.querySelector("#topic"),
         clientId: document.querySelector("#clientId"),
         tenantId: document.querySelector("#tenantId"),
+        token: document.querySelector("#token"),
         statusDot: document.querySelector("#statusDot"),
         statusText: document.querySelector("#statusText"),
         connectBtn: document.querySelector("#connectBtn"),
@@ -278,8 +283,12 @@
       function buildUrl() {
         const url = new URL(els.server.value);
         url.searchParams.set("topic", els.topic.value || "public");
-        url.searchParams.set("client_id", els.clientId.value || "web-demo");
-        url.searchParams.set("tenant_id", els.tenantId.value || "default");
+        if (els.token.value) {
+          url.searchParams.set("token", els.token.value);
+        } else {
+          url.searchParams.set("client_id", els.clientId.value || "web-demo");
+          url.searchParams.set("tenant_id", els.tenantId.value || "default");
+        }
         return url.toString();
       }
 
