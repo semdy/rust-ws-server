@@ -58,6 +58,8 @@ docker run -d \
 │              │ 例如：-e WS_JWT_SECRET=your-hmac-secret │
 └──────────────┴────────────────────────────────────────┘
 
+如果前面配置了 nginx 反代做 TLS 终止，还需要设 -e WS_TRUST_PROXY_HEADERS=true。
+
 # 日志
 docker logs -f ws
 
