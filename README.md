@@ -28,6 +28,19 @@ cargo run --release
 ws://127.0.0.1:8080/ws?topic=public&client_id=alice
 ```
 
+## 测试
+
+```bash
+cargo test                          # 全部测试（单元 + 集成）
+cargo test --lib                    # 仅单元测试（src/ 内的 #[cfg(test)] 模块）
+cargo test --test websocket         # 仅集成测试（tests/websocket.rs）
+cargo test --test websocket api_    # 按名称过滤
+cargo test auth::tests              # 指定模块
+cargo test api_                     # 按名称过滤，跑所有 API 相关测试
+```
+
+测试覆盖：鉴权、多租户隔离、IP/租户限流、广播、私聊、MessagePack 入站、HTTP API。
+
 ## 配置
 
 所有配置都支持环境变量：
@@ -339,6 +352,215 @@ socket.send(JSON.stringify({
 
 - **多实例广播**：单机核心定位下未内置。需要横向扩展时，可把广播抽象成 trait（默认内存实现，可替换为 Redis Pub/Sub / NATS / Kafka），不必改动协议层。
 - **告警规则与压测基线**：见下文 Grafana 小节，按面板里的趋势线设置阈值告警。
+
+## 业务系统对接指南
+
+rust-ws-server 作为消息网关，位于业务系统与终端客户端之间。典型的对接模式涉及三个角色：
+
+```
+┌─────────────────┐
+│  认证服务 (Issuer) │  ← 持有 JWT 签名密钥，为接入方签发 token
+└────────┬────────┘
+         │ 签发 token（REST / gRPC）
+         ▼
+┌─────────────────┐      HTTP API / WebSocket       ┌──────────────────┐
+│ 业务后端 (Pusher) │ ──────────────────────────────→ │ rust-ws-server   │
+│                 │ ←────────────────────────────── │                  │
+└─────────────────┘     订阅/接收（可选）             └────────┬─────────┘
+                                                            │ WebSocket
+                                                            ▼
+                                                     ┌──────────────────┐
+                                                     │ 终端客户端 (App)  │
+                                                     └──────────────────┘
+```
+
+- **认证服务**（Issuer）：业务系统自己的鉴权服务，持有 JWT 签名密钥（如 HS256 secret 或 RS256 私钥）。用户登录后签发包含 `sub`（client_id）和 `tenant_id` 的 JWT。
+- **业务后端**（Pusher）：需要向在线客户端推送消息的后台服务（如订单状态变更、IM 消息转发）。通过 **HTTP API** 或 **WebSocket 客户端** 两种方式接入。
+- **终端客户端**：浏览器/App，通过 WebSocket 连接 rust-ws-server，用认证服务签发的 token 握手。
+
+### 方式一：HTTP API 推送（推荐）
+
+业务后端无需维护 WebSocket 长连接，通过 REST 接口即可推送消息。适用于大多数服务端推送场景。
+
+#### 认证
+
+HTTP API 使用 Bearer token 鉴权，与服务端 JWT 鉴权共用同一套密钥和校验逻辑：
+
+```bash
+Authorization: Bearer <jwt-token>
+```
+
+> JWT token 的签发方式见上文「Token 生成」小节。业务后端通常由认证服务统一签发 token。
+
+#### 端点
+
+**`POST /api/publish`** — 向指定 topic 广播消息
+
+请求体：
+```json
+{
+  "topic": "order-events",
+  "request_id": "req-001",
+  "payload": { "order_id": "12345", "status": "shipped" }
+}
+```
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `topic` | 否 | 目标主题，缺省 `"public"` |
+| `request_id` | 否 | 请求追踪 ID，透传给接收方 |
+| `payload` | 是 | 任意 JSON 值，透传给所有订阅该 topic 的 WS 客户端 |
+
+成功响应（200）：
+```json
+{ "receivers": 3 }
+```
+
+`receivers` 表示实际送达的在线客户端数量；为 0 时服务端同时递增 `ws_messages_dropped_total` 计数器。
+
+**`POST /api/direct`** — 向指定 client_id 发送私聊消息
+
+请求体：
+```json
+{
+  "to": "bob",
+  "request_id": "req-002",
+  "payload": { "text": "hello bob" }
+}
+```
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `to` | 是 | 目标客户端 `client_id`。限定同租户，跨租户视为不存在 |
+| `request_id` | 否 | 请求追踪 ID |
+| `payload` | 是 | 任意 JSON 值 |
+
+成功响应（200）：
+```json
+{ "ok": true }
+```
+
+目标不在线响应（404）：
+```json
+{ "ok": false, "error": "client_not_found" }
+```
+
+#### HTTP API 错误码
+
+| 状态码 | 场景 |
+|--------|------|
+| 200 | 成功 |
+| 401 | 缺少或无效的 Authorization header / JWT |
+| 404 | direct 目标不在线或跨租户 |
+| 500 | 消息编码失败 |
+
+### 方式二：业务后端作为 WebSocket 客户端
+
+业务后端需要**双向通信**（如接收客户端上行消息、订阅多个 topic）时，可以直接作为 WS 客户端接入。此时业务后端与终端客户端的角色完全一致。
+
+**Rust 示例**（使用 `tokio-tungstenite`）：
+
+```rust
+use tokio_tungstenite::connect_async;
+use futures_util::SinkExt;
+
+// 用认证服务签发的 token 连接
+let token = "eyJhbGciOiJIUzI1NiIs...";
+let url = format!("ws://127.0.0.1:8080/ws?topic=order-events&token={token}");
+let (mut ws, _) = connect_async(&url).await?;
+
+// 接收消息
+while let Some(Ok(msg)) = ws.next().await {
+    // 出站统一为 MessagePack binary
+    if let Message::Binary(bytes) = msg {
+        let event: ServerEvent = rmp_serde::from_slice(&bytes)?;
+        // 处理 message / direct_message 事件
+    }
+}
+```
+
+**Go 示例**（使用 `gorilla/websocket`）：
+
+```go
+import "github.com/gorilla/websocket"
+
+token := "eyJhbGciOiJIUzI1NiIs..."
+url := "ws://127.0.0.1:8080/ws?topic=order-events&token=" + token
+conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+// 读取消息...
+```
+
+### 从业务系统签发 JWT
+
+业务系统（认证服务）用自己的密钥签发 JWT，不依赖 rust-ws-server 的 `mint-token` 工具。
+
+**Python 示例**（HS256）：
+
+```python
+import jwt
+import time
+
+secret = "your-hmac-secret"  # 与服务端 WS_JWT_SECRET 一致
+claims = {
+    "sub": "backend-svc-01",       # 推送方的 client_id
+    "tenant_id": "company-a",      # 目标租户
+    "exp": int(time.time()) + 3600
+}
+token = jwt.encode(claims, secret, algorithm="HS256")
+```
+
+**Python 示例**（RS256，推荐生产使用）：
+
+```python
+import jwt
+import time
+
+with open("private-key.pem") as f:
+    private_key = f.read()
+
+claims = {
+    "sub": "backend-svc-01",
+    "tenant_id": "company-a",
+    "exp": int(time.time()) + 3600
+}
+token = jwt.encode(claims, private_key, algorithm="RS256")
+```
+
+服务端配置对应公钥：
+```bash
+WS_JWT_PUBLIC_KEY="$(cat public-key.pem)"
+```
+
+**Go 示例**（HS256）：
+
+```go
+import "github.com/golang-jwt/jwt/v5"
+
+claims := jwt.MapClaims{
+    "sub":       "backend-svc-01",
+    "tenant_id": "company-a",
+    "exp":       time.Now().Add(1 * time.Hour).Unix(),
+}
+token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).
+    SignedString([]byte("your-hmac-secret"))
+```
+
+### 端到端流程
+
+```
+1. 用户登录 → 认证服务签发 JWT（含 sub=user-123, tenant_id=company-a）
+2. 终端客户端用 token 连接 rust-ws-server，订阅 topic "notifications"
+3. 业务后端（如订单系统）状态变更，向 /api/publish 发 POST：
+     Authorization: Bearer <后台自己的 token，tenant_id=company-a>
+     { "topic": "notifications", "payload": { "order_id": "X", "status": "done" } }
+4. rust-ws-server 校验 tenant_id，投递到 company-a:notifications 主题
+5. 终端客户端收到 MessagePack 消息，展示通知
+```
+
+关键约束：
+- 推送方 token 的 `tenant_id` 决定了能推送到的租户范围。跨租户推送被路由隔离。
+- `direct` 消息的 `to` 字段也限定同租户，跨租户返回 `client_not_found`。
+- API 不提供租户间消息转发——这是业务层该做的事（如拆成两次 publish）。
 
 ## Grafana
 

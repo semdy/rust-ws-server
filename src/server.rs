@@ -11,7 +11,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -56,6 +56,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/ws", get(ws_handler))
+        .route("/api/publish", post(crate::api::api_publish))
+        .route("/api/direct", post(crate::api::api_direct))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -675,7 +677,7 @@ fn tokens_to_add(elapsed: Duration, refill_per_second: f64) -> f64 {
     elapsed.as_secs_f64() * refill_per_second
 }
 
-fn normalize_topic(topic: &str) -> String {
+pub(crate) fn normalize_topic(topic: &str) -> String {
     let topic = topic.trim().trim_start_matches('/');
     if topic.is_empty() {
         "public".to_owned()

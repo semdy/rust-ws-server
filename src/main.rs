@@ -1,15 +1,7 @@
-mod auth;
-mod config;
-mod ip_limiter;
-mod metrics;
-mod protocol;
-mod server;
-mod state;
-
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::{config::Config, state::AppState};
+use rust_ws_server::{config::Config, state::AppState, server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

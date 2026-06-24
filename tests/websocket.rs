@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use reqwest::StatusCode;
+use url::Url;
 
 const TEST_SECRET: &str = "test-secret";
 
@@ -112,6 +114,14 @@ fn text_message(value: serde_json::Value) -> Message {
 
 fn binary_message(value: serde_json::Value) -> Message {
     Message::Binary(rmp_serde::to_vec_named(&value).unwrap().into())
+}
+
+fn http_url(addr: SocketAddr, path: &str) -> Url {
+    format!("http://{addr}{path}").parse().unwrap()
+}
+
+fn auth_header(token: &str) -> String {
+    format!("Bearer {token}")
 }
 
 async fn next_server_event<S>(socket: &mut S) -> Value
@@ -598,5 +608,212 @@ async fn tenant_rate_limit_does_not_affect_other_tenants() {
         }
     }
     assert!(got_pong, "t2 should still respond after t1 flooded its own tenant bucket");
+    handle.abort();
+}
+
+// ── HTTP API integration tests ────────────────────────────────────────────
+
+#[tokio::test]
+async fn api_publish_delivers_to_ws_client() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token = token_for("alice", Some("t1"));
+
+    // Connect a WS subscriber.
+    let (mut ws, _) = connect_async(format!("ws://{addr}/ws?topic=room&token={token}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut ws).await;
+
+    // Publish via HTTP API.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(http_url(addr, "/api/publish"))
+        .header("Authorization", auth_header(&token))
+        .json(&json!({"topic": "room", "payload": {"text": "from-api"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["receivers"], 1);
+
+    // WS client must receive the message.
+    let received = next_server_event(&mut ws).await;
+    assert_eq!(received["kind"], "message");
+    assert_eq!(received["payload"]["text"], "from-api");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_direct_to_absent_target_returns_404() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token = token_for("alice", Some("t1"));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(http_url(addr, "/api/direct"))
+        .header("Authorization", auth_header(&token))
+        .json(&json!({"to": "nobody", "payload": {"text": "hi"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "client_not_found");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_without_token_returns_401() {
+    let (addr, handle) = spawn_auth_server().await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(http_url(addr, "/api/publish"))
+        .json(&json!({"topic": "room", "payload": {"text": "x"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_publish_tenant_isolation() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token_t1 = token_for("alice", Some("t1"));
+    let token_t2 = token_for("bob", Some("t2"));
+
+    // Connect WS subscribers for both tenants on the same topic name.
+    let (mut ws_t1, _) = connect_async(format!("ws://{addr}/ws?topic=room&token={token_t1}"))
+        .await
+        .unwrap();
+    let (mut ws_t2, _) = connect_async(format!("ws://{addr}/ws?topic=room&token={token_t2}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut ws_t1).await;
+    let _ = next_server_event(&mut ws_t2).await;
+
+    let client = reqwest::Client::new();
+
+    // Publish as t1.
+    let resp = client
+        .post(http_url(addr, "/api/publish"))
+        .header("Authorization", auth_header(&token_t1))
+        .json(&json!({"topic": "room", "payload": {"text": "t1-only"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // t1's WS client should receive it.
+    let received = next_server_event(&mut ws_t1).await;
+    assert_eq!(received["kind"], "message");
+    assert_eq!(received["payload"]["text"], "t1-only");
+
+    // t2's WS client must NOT receive it.
+    let not_received = tokio::time::timeout(Duration::from_millis(200), ws_t2.next()).await;
+    assert!(not_received.is_err());
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_direct_cross_tenant_rejection() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token_t1 = token_for("alice", Some("t1"));
+    let token_t2 = token_for("bob", Some("t2"));
+
+    // Bob connects as t2.
+    let (mut ws_bob, _) = connect_async(format!("ws://{addr}/ws?topic=test&token={token_t2}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut ws_bob).await;
+
+    let client = reqwest::Client::new();
+
+    // Alice (t1) tries to direct-message bob — must fail with client_not_found.
+    let resp = client
+        .post(http_url(addr, "/api/direct"))
+        .header("Authorization", auth_header(&token_t1))
+        .json(&json!({"to": "bob", "payload": {"text": "cross-tenant"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "client_not_found");
+
+    // Bob must not receive anything.
+    let not_received = tokio::time::timeout(Duration::from_millis(200), ws_bob.next()).await;
+    assert!(not_received.is_err());
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_publish_without_topic_defaults_to_public() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token = token_for("alice", Some("t1"));
+
+    // Connect a WS subscriber to "public".
+    let (mut ws, _) = connect_async(format!("ws://{addr}/ws?topic=public&token={token}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut ws).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(http_url(addr, "/api/publish"))
+        .header("Authorization", auth_header(&token))
+        .json(&json!({"payload": {"text": "default-topic"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = next_server_event(&mut ws).await;
+    assert_eq!(received["kind"], "message");
+    assert_eq!(received["payload"]["text"], "default-topic");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_direct_delivers_to_ws_client() {
+    let (addr, handle) = spawn_auth_server().await;
+    let token_alice = token_for("alice", Some("t1"));
+    let token_bob = token_for("bob", Some("t1"));
+
+    // Bob connects as t1.
+    let (mut ws_bob, _) = connect_async(format!("ws://{addr}/ws?topic=test&token={token_bob}"))
+        .await
+        .unwrap();
+    let _ = next_server_event(&mut ws_bob).await;
+
+    // Alice sends a direct message to Bob via HTTP API.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(http_url(addr, "/api/direct"))
+        .header("Authorization", auth_header(&token_alice))
+        .json(&json!({"to": "bob", "payload": {"text": "hello bob"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    // Bob receives it.
+    let received = next_server_event(&mut ws_bob).await;
+    assert_eq!(received["kind"], "direct_message");
+    assert_eq!(received["from"], "alice");
+    assert_eq!(received["payload"]["text"], "hello bob");
+
     handle.abort();
 }
