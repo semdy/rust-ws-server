@@ -1,6 +1,12 @@
 FROM rust:1.87-slim AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
+
+# Cache dependencies — touch a dummy main.rs so cargo can compile them.
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+COPY Cargo.toml Cargo.lock ./
+RUN cargo build --release
+
+# Build real binary (src changed → only this layer rebuilds).
 COPY src ./src
 RUN cargo build --release
 

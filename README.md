@@ -28,6 +28,52 @@ cargo run --release
 ws://127.0.0.1:8080/ws?topic=public&client_id=alice
 ```
 
+## 部署
+
+**Docker（推荐）**
+
+```bash
+# 构建镜像
+docker build -t rust-ws-server . # -t rust-ws-server 是给镜像起个名字（tag），. 是告诉 docker 在当前目录找 Dockerfile。
+
+# 启动服务
+docker run -d \
+  --name ws \
+  -p 8080:8080 \
+  -e WS_JWT_SECRET=your-hmac-secret \
+  -e WS_TRUST_PROXY_HEADERS=true \
+  -e WS_TENANT_MAX_CONNECTIONS=500 \
+  rust-ws-server
+
+┌──────────────┬────────────────────────────────────────┐
+│     参数      │                  含义                  │
+├──────────────┼────────────────────────────────────────┤
+│ -d           │ 后台运行                                │
+├──────────────┼────────────────────────────────────────┤
+│ --name ws    │ 容器名，方便后续管理                      │
+├──────────────┼────────────────────────────────────────┤
+│ -p 8080:8080 │ 把服务器的 8080 端口映射到容器             │
+├──────────────┼────────────────────────────────────────┤
+│ -e           │ 注入环境变量（JWT secret、租户配额等）      │
+│              │ 例如：-e WS_JWT_SECRET=your-hmac-secret │
+└──────────────┴────────────────────────────────────────┘
+
+# 日志
+docker logs -f ws
+
+# 停止
+docker stop ws
+```
+
+**独立二进制**
+
+```bash
+# musl 静态编译，产出完全独立的二进制
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+# scp target/x86_64-unknown-linux-musl/release/rust-ws-server user@host:/opt/
+```
+
 ## 测试
 
 ```bash
