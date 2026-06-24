@@ -274,7 +274,7 @@ cargo run --release
 3. 点击“连接”，默认会连接：
 
 ```text
-ws://127.0.0.1:8080/ws?topic=public&client_id=web-demo
+ws://127.0.0.1:8080/ws?topic=public&client_id=web-demo&tenant_id=default
 ```
 
 页面里支持群聊和点对点私聊。测试私聊时可以打开两个浏览器标签页：
